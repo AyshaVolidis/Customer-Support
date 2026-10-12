@@ -1,10 +1,20 @@
-// Scratch script for running the agent by hand: npm run try
-// Reads orders (cancels nothing) and round-trips one session_state row.
+// Scratch script for running things by hand:
+//   npm run try -- db                                    (default) read-only DB smoke test
+//   npm run try -- model "say hi in one sentence"        one generateText call
+//   npm run try -- classify "<message>" [offered]        classifyIntent; "offered" sets
+//                                                        handoffOffered = true
+//
+// Temporary: this is a scratch harness, not part of the workflow.
+
+import { generateText } from 'ai';
 
 import { DEMO_CUSTOMER_ID } from '../lib/config';
+import { classifyIntent } from '../lib/llm';
+import { getModel } from '../lib/model';
 import { getRepositories } from '../lib/repositories';
 
-async function main(): Promise<void> {
+/** Read-only order checks, plus one session_state round trip. */
+async function tryDatabase(): Promise<void> {
   const { orders, sessions } = getRepositories();
 
   console.log('--- order 1002 ---');
@@ -31,6 +41,59 @@ async function main(): Promise<void> {
 
   console.log(`\n--- read an unknown session (expect idle) ---`);
   console.log(await sessions.getState('try-does-not-exist'));
+}
+
+/** One generateText call, to check the model and API key work. */
+async function tryModel(prompt: string): Promise<void> {
+  console.log(`--- prompt ---\n${prompt}\n`);
+
+  const result = await generateText({
+    model: getModel(),
+    prompt,
+  });
+
+  console.log(`--- response ---\n${result.text}`);
+}
+
+/** One classifyIntent call, printed as JSON. */
+async function tryClassify(message: string, handoffOffered: boolean): Promise<void> {
+  const result = await classifyIntent({ message, handoffOffered });
+
+  console.log(`\n--- classification (handoffOffered: ${String(handoffOffered)}) ---`);
+  console.log(JSON.stringify(result, null, 2));
+}
+
+async function main(): Promise<void> {
+  const [mode = 'db', ...rest] = process.argv.slice(2);
+
+  if (mode === 'db') {
+    await tryDatabase();
+    return;
+  }
+
+  if (mode === 'model') {
+    const prompt = rest.join(' ').trim();
+    if (!prompt) {
+      throw new Error('Usage: npm run try -- model "your prompt here"');
+    }
+    await tryModel(prompt);
+    return;
+  }
+
+  if (mode === 'classify') {
+    // The last word may be the literal flag "offered".
+    const handoffOffered = rest.at(-1) === 'offered';
+    const words = handoffOffered ? rest.slice(0, -1) : rest;
+    const message = words.join(' ').trim();
+
+    if (!message) {
+      throw new Error('Usage: npm run try -- classify "your message here" [offered]');
+    }
+    await tryClassify(message, handoffOffered);
+    return;
+  }
+
+  throw new Error(`Unknown mode "${mode}". Use "db", "model" or "classify".`);
 }
 
 main().catch((error: unknown) => {
