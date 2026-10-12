@@ -3,15 +3,20 @@
 //   npm run try -- model "say hi in one sentence"        one generateText call
 //   npm run try -- classify "<message>" [offered]        classifyIntent; "offered" sets
 //                                                        handoffOffered = true
+//   npm run try -- reply "<message>" "<facts>" [intent]  writeReply; intent defaults
+//                                                        to order_lookup
+//   npm run try -- chat <sessionId> "<message>"          handleMessage end to end
 //
 // Temporary: this is a scratch harness, not part of the workflow.
 
 import { generateText } from 'ai';
 
+import { handleMessage } from '../lib/agent';
 import { DEMO_CUSTOMER_ID } from '../lib/config';
-import { classifyIntent } from '../lib/llm';
+import { classifyIntent, writeReply } from '../lib/llm';
 import { getModel } from '../lib/model';
 import { getRepositories } from '../lib/repositories';
+import { IntentSchema, type Intent } from '../lib/schema';
 
 /** Read-only order checks, plus one session_state round trip. */
 async function tryDatabase(): Promise<void> {
@@ -63,6 +68,22 @@ async function tryClassify(message: string, handoffOffered: boolean): Promise<vo
   console.log(JSON.stringify(result, null, 2));
 }
 
+/** One writeReply call, printing the phrased reply. */
+async function tryReply(message: string, facts: string, intent: Intent): Promise<void> {
+  const reply = await writeReply({ intent, facts, customerMessage: message });
+
+  console.log(`\n--- reply (intent: ${intent}) ---`);
+  console.log(reply);
+}
+
+/** One full handleMessage round trip, printed as JSON. */
+async function tryChat(sessionId: string, message: string): Promise<void> {
+  const response = await handleMessage(sessionId, message);
+
+  console.log(`\n--- response (session: ${sessionId}) ---`);
+  console.log(JSON.stringify(response, null, 2));
+}
+
 async function main(): Promise<void> {
   const [mode = 'db', ...rest] = process.argv.slice(2);
 
@@ -93,7 +114,36 @@ async function main(): Promise<void> {
     return;
   }
 
-  throw new Error(`Unknown mode "${mode}". Use "db", "model" or "classify".`);
+  if (mode === 'reply') {
+    const [message, facts, intentArg] = rest;
+
+    if (!message || !facts) {
+      throw new Error('Usage: npm run try -- reply "<message>" "<facts>" [intent]');
+    }
+
+    // intent is optional on the CLI; the real caller always passes one.
+    const parsedIntent = IntentSchema.safeParse(intentArg ?? 'order_lookup');
+    if (!parsedIntent.success) {
+      throw new Error(`Unknown intent "${String(intentArg)}". See IntentSchema for the five.`);
+    }
+
+    await tryReply(message, facts, parsedIntent.data);
+    return;
+  }
+
+  if (mode === 'chat') {
+    const [sessionId, ...words] = rest;
+    const message = words.join(' ').trim();
+
+    if (!sessionId || !message) {
+      throw new Error('Usage: npm run try -- chat <sessionId> "<message>"');
+    }
+
+    await tryChat(sessionId, message);
+    return;
+  }
+
+  throw new Error(`Unknown mode "${mode}". Use "db", "model", "classify", "reply" or "chat".`);
 }
 
 main().catch((error: unknown) => {
