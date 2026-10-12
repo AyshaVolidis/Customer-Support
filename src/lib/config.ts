@@ -11,3 +11,6 @@ export const DEMO_CUSTOMER_ID = 'cust_001';
  * (gate G7). 1 means two attempts in total, then a clear error.
  */
 export const LLM_SCHEMA_RETRIES = 1;
+
+/** Longest customer message we accept (gate G9), in characters. */
+export const MAX_MESSAGE_LENGTH = 500;
