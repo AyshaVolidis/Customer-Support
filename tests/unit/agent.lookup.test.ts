@@ -174,8 +174,8 @@ describe('order_lookup - a malformed order id (G1)', () => {
 
     await handleMessage(SESSION, 'where is my order?', { repos, llm });
 
-    expect(getLatestOrder).not.toHaveBeenCalled();
-    expect(factsPassedTo(llm)).toBe('Order numbers are four digits, like 1002.');
+    expect(getLatestOrder).toHaveBeenCalled();
+    expect(factsPassedTo(llm)).toContain('most recent order');
   });
 });
 

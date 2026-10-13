@@ -113,7 +113,7 @@ async function handleOrderLookup({
 }: OrderLookupArgs): Promise<ChatResponse> {
   let facts: string;
 
-  if (orderId === null) {
+  if (orderId === null || orderId.trim() === '') {
     const latest = await repos.orders.getLatestOrder(customerId);
     facts =
       latest === null ? NO_ORDERS_FACT : [orderFacts(latest), MOST_RECENT_ORDER_FACT].join('\n');
