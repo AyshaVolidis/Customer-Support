@@ -65,7 +65,6 @@ const NO_ORDERS_FACT = 'The customer has no orders at all.';
  */
 function orderFacts(order: Order): string {
   return [
-    `Order ${order.id}.`,
     `Item: ${order.itemSummary}.`,
     `Status: ${order.status}.`,
     `Ordered on: ${order.createdAt.slice(0, 10)}.`,
