@@ -52,8 +52,7 @@ function refusal(userMessage: string): ChatResponse {
 
 /** Told to the model when the customer gave no order number. */
 const MOST_RECENT_ORDER_FACT =
-  "This is the customer's most recent order. They did not give an order number. " +
-  'Invite them to send a 4-digit order number if they meant a different order.';
+  "This is the customer's most recent order. They did not give an order number. ";
 
 /** Told to the model when the customer has never ordered anything. */
 const NO_ORDERS_FACT = 'The customer has no orders at all.';

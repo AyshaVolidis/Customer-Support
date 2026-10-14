@@ -2,7 +2,7 @@
 // This is the ONLY file that knows which provider we use. Nowhere else names
 // a model or imports a provider package.
 
-import { google } from '@ai-sdk/google';
+import { groq } from '@ai-sdk/groq';
 import type { LanguageModel } from 'ai';
 
 /**
@@ -23,12 +23,18 @@ function requireEnv(name: string): string {
 /**
  * The language model to use, named by LLM_MODEL.
  *
- * The provider reads GOOGLE_GENERATIVE_AI_API_KEY from the environment itself,
- * so we check it here only to fail with a clear message instead of a 401 later.
+ * Provider: Groq. Model ids the installed @ai-sdk/groq knows about include
+ * llama-3.3-70b-versatile, llama-3.1-8b-instant, openai/gpt-oss-120b,
+ * openai/gpt-oss-20b, moonshotai/kimi-k2-instruct-0905 and
+ * meta-llama/llama-4-scout-17b-16e-instruct; any other string is passed
+ * through to the API unchanged.
+ *
+ * The provider reads GROQ_API_KEY from the environment itself, so we check it
+ * here only to fail with a clear message instead of a 401 later.
  */
 export function getModel(): LanguageModel {
-  requireEnv('GOOGLE_GENERATIVE_AI_API_KEY');
+  requireEnv('GROQ_API_KEY');
   const modelName = requireEnv('LLM_MODEL');
 
-  return google(modelName);
+  return groq(modelName);
 }
