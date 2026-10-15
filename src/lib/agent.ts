@@ -2,15 +2,17 @@
 // This is the workflow entry point. The CODE decides and routes; the LLM only
 // classifies and phrases.
 //
-// SKELETON: every intent currently answers "not implemented yet". The state is
-// loaded and logged but never written and never branched on.
+// PARTLY BUILT: order_lookup is implemented. The pending-reply branch routes a
+// reply to our own question away from intent classification, but continuing a
+// cancel flow still answers "not implemented yet", as do the other intents.
 
+import { buildCandidateOrders, labelsForLlm, toOptions } from './cancelHelpers';
 import { DEMO_CUSTOMER_ID } from './config';
-import { gateMessage } from './gates';
-import { classifyIntent, writeReply } from './llm';
+import { gateMessage, gateOrderCancellable } from './gates';
+import { classifyIntent, classifyPendingReply, writeReply } from './llm';
 import { logInfo } from './logger';
 import { getRepositories } from './repositories';
-import type { Order, Repositories } from './repositories/types';
+import type { Order, Repositories, SessionState } from './repositories/types';
 import { type ChatResponse, ChatResponseSchema, type Intent } from './schema';
 import { lookupOrder } from './tools';
 
@@ -22,6 +24,7 @@ export type Deps = {
   repos: Repositories;
   llm: {
     classifyIntent: typeof classifyIntent;
+    classifyPendingReply: typeof classifyPendingReply;
     writeReply: typeof writeReply;
   };
 };
@@ -31,6 +34,22 @@ function notImplemented(intent: Intent): ChatResponse {
   return {
     answer: `That part of this assistant is not implemented yet (${intent}).`,
     intent,
+    needsConfirmation: false,
+    options: [],
+    offerHandoff: false,
+    sources: [],
+  };
+}
+
+/**
+ * The reply when the customer answered our own pending question.
+ *
+ * Placeholder: the cancel steps that continue the flow are not built yet.
+ */
+function pendingFlowNotImplemented(): ChatResponse {
+  return {
+    answer: 'Thanks - continuing that request is not implemented yet.',
+    intent: 'cancel_order',
     needsConfirmation: false,
     options: [],
     offerHandoff: false,
@@ -134,6 +153,167 @@ async function handleOrderLookup({
   };
 }
 
+type CancelWithIdArgs = {
+  sessionId: string;
+  message: string;
+  /** The id the classifier extracted. Not trusted: G1 checks it first. */
+  orderId: string;
+  customerId: string;
+  repos: Repositories;
+  llm: Deps['llm'];
+};
+
+/** A cancel_order reply. Only the flag and the options vary. */
+function cancelResponse(
+  answer: string,
+  needsConfirmation: boolean,
+  options: ChatResponse['options'] = [],
+): ChatResponse {
+  return {
+    answer,
+    intent: 'cancel_order',
+    needsConfirmation,
+    options,
+    offerHandoff: false,
+    sources: [],
+  };
+}
+
+type CancelWithoutIdArgs = {
+  sessionId: string;
+  message: string;
+  customerId: string;
+  repos: Repositories;
+  llm: Deps['llm'];
+};
+
+/** Told to the model when there is nothing the customer could cancel. */
+const NOTHING_TO_CANCEL_FACT =
+  'The customer has no orders that can be cancelled right now. ';
+
+/**
+ * Cancel flow, the other opening: the customer did not name an order.
+ *
+ * Offers the cancellable orders as a NUMBERED list. The model is given the
+ * labels only - the real ids stay in the state and in the code, so the model
+ * cannot invent or leak one, and the customer's answer is just a number.
+ */
+async function handleCancelWithoutOrderId({
+  sessionId,
+  message,
+  customerId,
+  repos,
+  llm,
+}: CancelWithoutIdArgs): Promise<ChatResponse> {
+  // Only 'processing' orders come back, oldest first (G4 by construction).
+  const cancellable = await repos.orders.getCancellableOrders(customerId);
+
+  if (cancellable.length === 0) {
+    logInfo('cancel: nothing to offer', { customerId });
+    return cancelResponse(
+      await llm.writeReply({
+        intent: 'cancel_order',
+        facts: NOTHING_TO_CANCEL_FACT,
+        customerMessage: message,
+      }),
+      false,
+    );
+  }
+
+  const candidates = buildCandidateOrders(cancellable);
+
+  // Built from scratch: nothing from an earlier turn survives into this flow.
+  const next: SessionState = {
+    step: 'awaiting_order_selection',
+    candidateOrders: candidates,
+    retries: 0,
+  };
+  await repos.sessions.setState(sessionId, customerId, next);
+
+  // labelsForLlm is numbers and labels only - never an order id.
+  const facts = [
+    'These are the orders the customer can still cancel:',
+    labelsForLlm(candidates),
+    'Ask which one they mean and tell them to reply with its number.',
+    'Nothing has been cancelled yet.',
+  ].join('\n');
+
+  return cancelResponse(
+    await llm.writeReply({ intent: 'cancel_order', facts, customerMessage: message }),
+    false,
+    toOptions(candidates),
+  );
+}
+
+/**
+ * Cancel flow, first half: the customer named an order.
+ *
+ * Gates in order: G1 and G2 and G3 via lookupOrder, then G4. Nothing is
+ * cancelled here - this only asks the confirmation question. cancelOrder is
+ * called later, after an explicit yes (G6) and a re-check of G1-G4.
+ */
+async function handleCancelWithOrderId({
+  sessionId,
+  message,
+  orderId,
+  customerId,
+  repos,
+  llm,
+}: CancelWithIdArgs): Promise<ChatResponse> {
+  // G1 (format), G2 (exists), G3 (ownership). A failure hands back only a
+  // userMessage, and "missing" and "not yours" are the same message, so the
+  // customer cannot tell another customer's order from a made-up number.
+  const found = await lookupOrder({ orderId, customerId, orders: repos.orders });
+
+  if (!found.ok) {
+    logInfo('cancel refused', { reason: found.reason });
+    return cancelResponse(
+      await llm.writeReply({
+        intent: 'cancel_order',
+        facts: found.userMessage,
+        customerMessage: message,
+      }),
+      false,
+    );
+  }
+
+  // G4: only an order still being processed can be cancelled.
+  const cancellable = gateOrderCancellable(found.order);
+
+  if (!cancellable.ok) {
+    logInfo('cancel refused', { reason: cancellable.reason, orderId: found.order.id });
+    return cancelResponse(
+      await llm.writeReply({
+        intent: 'cancel_order',
+        facts: cancellable.userMessage,
+        customerMessage: message,
+      }),
+      false,
+    );
+  }
+
+  // Built from scratch, never spread, so no handoffOffered, problemText or
+  // candidateOrders from an earlier turn survive into this flow.
+  const next: SessionState = {
+    step: 'awaiting_confirmation',
+    selectedOrderId: found.order.id,
+    retries: 0,
+  };
+  await repos.sessions.setState(sessionId, customerId, next);
+
+  // The customer supplied this id, so repeating it back is safe and useful.
+  const facts = [
+    `Ask the customer to confirm this cancellation, and nothing else: like Do you want`,
+    `Cancel order ${found.order.id} (${found.order.itemSummary})?`,
+    `Nothing has been cancelled yet.`,
+  ].join('\n');
+
+  return cancelResponse(
+    await llm.writeReply({ intent: 'cancel_order', facts, customerMessage: message }),
+    true,
+  );
+}
+
 /**
  * Handle one customer message.
  *
@@ -155,11 +335,34 @@ export async function handleMessage(
   // `??` keeps these lazy: a test that injects repos never builds the real
   // Supabase client, so no env vars are needed.
   const repos = deps?.repos ?? getRepositories();
-  const llm = deps?.llm ?? { classifyIntent, writeReply };
+  const llm = deps?.llm ?? { classifyIntent, classifyPendingReply, writeReply };
   const customerId = DEMO_CUSTOMER_ID;
 
-  const state = await repos.sessions.getState(sessionId);
-  logInfo('loaded session state', { sessionId, customerId, state });
+  const stored = await repos.sessions.getState(sessionId);
+  logInfo('loaded session state', { sessionId, customerId, state: stored });
+
+  // The state the rest of this turn works from. It only differs from `stored`
+  // when a pending flow was abandoned below.
+  let state = stored;
+
+  if (stored.step !== 'idle') {
+    // We are waiting on an answer, so ask that question BEFORE classifying the
+    // intent: "yes" or "the second one" means nothing without the question.
+    const pending = await llm.classifyPendingReply({ message, state: stored });
+    logInfo('classified a pending reply', { step: stored.step, kind: pending.kind });
+
+    if (pending.kind === 'answer_to_pending') {
+      // Leave the stored state exactly as it is: the step that continues this
+      // flow owns it, and it is not built yet.
+      return validateResponse(pendingFlowNotImplemented());
+    }
+
+    // new_topic: abandon the flow. Built from scratch, never spread, so no
+    // candidateOrders, selectedOrderId, retries or handoffOffered survive.
+    const reset: SessionState = { step: 'idle' };
+    await repos.sessions.setState(sessionId, customerId, reset);
+    state = reset;
+  }
 
   const classification = await llm.classifyIntent({
     message,
@@ -181,8 +384,27 @@ export async function handleMessage(
           llm,
         }),
       );
-    case 'cancel_order':
-      return validateResponse(notImplemented('cancel_order'));
+    case 'cancel_order': {
+      const requested = classification.orderId;
+
+      // No order number given: offer the cancellable orders as a numbered list.
+      if (requested === null || requested.trim() === '') {
+        return validateResponse(
+          await handleCancelWithoutOrderId({ sessionId, message, customerId, repos, llm }),
+        );
+      }
+
+      return validateResponse(
+        await handleCancelWithOrderId({
+          sessionId,
+          message,
+          orderId: requested,
+          customerId,
+          repos,
+          llm,
+        }),
+      );
+    }
     case 'human_handoff':
       return validateResponse(notImplemented('human_handoff'));
     case 'out_of_scope':

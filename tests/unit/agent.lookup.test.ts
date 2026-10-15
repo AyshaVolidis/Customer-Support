@@ -25,6 +25,7 @@ function fakeLlm(orderId: string | null): Deps['llm'] {
   return {
     classifyIntent: vi.fn(() => Promise.resolve(classification)),
     writeReply: vi.fn(() => Promise.resolve(REPLY)),
+    classifyPendingReply: vi.fn(() => Promise.resolve({ kind: 'new_topic' as const })),
   };
 }
 
