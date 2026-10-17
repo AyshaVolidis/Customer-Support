@@ -51,6 +51,12 @@ function makeLlm(options: { intent?: IntentClassification; pending?: PendingKind
       order.push('classifyPendingReply');
       return Promise.resolve(pending);
     }),
+    // Added once awaiting_order_selection stopped being a placeholder: an
+    // answer_to_pending reply in that step now runs the selection logic.
+    interpretOrderSelection: vi.fn(() => {
+      order.push('interpretOrderSelection');
+      return Promise.resolve({ kind: 'choose' as const, choice: 2 });
+    }),
     writeReply: vi.fn((_input: Parameters<typeof writeReply>[0]) => {
       order.push('writeReply');
       return Promise.resolve(REPLY);
@@ -213,7 +219,7 @@ describe('4. new_topic resets the state, then routes normally', () => {
   });
 });
 
-describe('5. answer_to_pending returns a placeholder and touches nothing', () => {
+describe('5. answer_to_pending in awaiting_order_selection runs the selection logic', () => {
   it('does not call classifyIntent', async () => {
     const repos = createMemoryRepositories();
     const { llm } = makeLlm({ pending: 'answer_to_pending' });
@@ -224,7 +230,7 @@ describe('5. answer_to_pending returns a placeholder and touches nothing', () =>
     expect(llm.classifyIntent).not.toHaveBeenCalled();
   });
 
-  it('returns a schema-valid cancel_order response', async () => {
+  it('routes to the selection logic instead of a placeholder', async () => {
     const repos = createMemoryRepositories();
     const { llm } = makeLlm({ pending: 'answer_to_pending' });
     await repos.sessions.setState(SESSION, CUSTOMER, AWAITING_SELECTION);
@@ -233,22 +239,23 @@ describe('5. answer_to_pending returns a placeholder and touches nothing', () =>
 
     expect(ChatResponseSchema.safeParse(response).success).toBe(true);
     expect(response.intent).toBe('cancel_order');
-    expect(response.answer).toContain('not implemented yet');
+    expect(llm.interpretOrderSelection).toHaveBeenCalledTimes(1);
+    expect(response.answer).not.toContain('not implemented yet');
   });
 
-  it('leaves the stored state deep-equal to what it was', async () => {
+  it('advances the stored state to the chosen order', async () => {
     const repos = createMemoryRepositories();
     const { llm } = makeLlm({ pending: 'answer_to_pending' });
     await repos.sessions.setState(SESSION, CUSTOMER, AWAITING_SELECTION);
-    const before = await repos.sessions.getState(SESSION);
 
     await handleMessage(SESSION, 'the second one', { repos, llm });
 
-    const after = await repos.sessions.getState(SESSION);
-    expect(after).toEqual(before);
-    expect(after).toEqual(AWAITING_SELECTION);
-    expect(after.candidateOrders).toHaveLength(3);
-    expect(after.retries).toBe(1);
+    // The fake chooses option 2, which is order 1005 in AWAITING_SELECTION.
+    expect(await repos.sessions.getState(SESSION)).toEqual({
+      step: 'awaiting_confirmation',
+      selectedOrderId: '1005',
+      retries: 0,
+    });
   });
 });
 

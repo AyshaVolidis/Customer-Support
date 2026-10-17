@@ -10,11 +10,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { handleMessage } from '../../src/lib/agent';
+import { labelsForLlm, toOptions } from '../../src/lib/cancelHelpers';
 import { ORDER_NOT_FOUND_MESSAGE, gateOrderCancellable } from '../../src/lib/gates';
 import { createMemoryRepositories } from '../../src/lib/repositories/memory';
+import type { CandidateOrder, Order, SessionState } from '../../src/lib/repositories/types';
 import {
   CUSTOMER,
   SESSION,
+  awaitingSelection,
   containsAnyOrderId,
   makeLlm,
   spyCancel,
@@ -25,6 +28,35 @@ const G1_MESSAGE = 'Order numbers are four digits, like 1002.';
 
 /** The real ids of cust_001's cancellable orders, oldest first. */
 const CANCELLABLE_IDS = ['1003', '1005', '1006'];
+
+/**
+ * NOTE: src/lib/config.ts has no MAX_RETRIES yet, so it cannot be imported.
+ * This is the value docs/design.md section 4 specifies ("With MAX_RETRIES = 2,
+ * the customer gets two re-asks and the third unclear reply goes to idle").
+ * Replace this with the import once the constant exists.
+ */
+const MAX_RETRIES = 2;
+
+/** What the code passed to interpretOrderSelection on its first call. */
+function selectionInput(llm: ReturnType<typeof makeLlm>['llm']): {
+  message: string;
+  labels: string;
+} {
+  const call = llm.interpretOrderSelection.mock.calls[0];
+  if (!call) throw new Error('interpretOrderSelection was not called');
+  return call[0] as { message: string; labels: string };
+}
+
+/** Store the awaiting_order_selection state, returning the candidates used. */
+async function putAwaitingSelection(
+  repos: ReturnType<typeof createMemoryRepositories>,
+  override?: (state: SessionState) => SessionState,
+): Promise<CandidateOrder[]> {
+  const base = await awaitingSelection(repos);
+  const state = override ? override(base) : base;
+  await repos.sessions.setState(SESSION, CUSTOMER, state);
+  return state.candidateOrders ?? [];
+}
 
 /** The userMessage gateOrderCancellable gives for one order, from the real gate. */
 async function cancellableGateMessage(
@@ -295,6 +327,200 @@ describe('cancel flow', () => {
       const state = await repos.sessions.getState(SESSION);
       expect(state.step).toBe('awaiting_order_selection');
       expect(state.candidateOrders?.map((candidate) => candidate.id)).toEqual(['1005']);
+      expect(cancelOrder).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('selecting an order', () => {
+    it('1. a valid choice moves to awaiting_confirmation', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        pending: 'answer_to_pending',
+        selection: { kind: 'choose', choice: 2 },
+      });
+      const cancelOrder = spyCancel(repos);
+      await putAwaitingSelection(repos);
+
+      const response = await handleMessage(SESSION, 'the second one', { repos, llm });
+
+      expect(response.intent).toBe('cancel_order');
+      expect(response.needsConfirmation).toBe(true);
+      expect(response.answer).toContain('1005');
+      expect(response.answer).toContain('Wireless headphones');
+
+      expect(await repos.sessions.getState(SESSION)).toEqual({
+        step: 'awaiting_confirmation',
+        selectedOrderId: '1005',
+        retries: 0,
+      });
+
+      expect(cancelOrder).not.toHaveBeenCalled();
+      expect(await statusOf(repos, '1005')).toBe('processing');
+    });
+
+    it('2. the model is given the numbered labels, and no order id', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        pending: 'answer_to_pending',
+        selection: { kind: 'choose', choice: 2 },
+      });
+      const cancelOrder = spyCancel(repos);
+      const candidates = await putAwaitingSelection(repos);
+
+      await handleMessage(SESSION, 'the second one', { repos, llm });
+
+      expect(selectionInput(llm).labels).toBe(labelsForLlm(candidates));
+      expect(containsAnyOrderId(llm.interpretOrderSelection.mock.calls, CANCELLABLE_IDS)).toBe(
+        false,
+      );
+      expect(cancelOrder).not.toHaveBeenCalled();
+    });
+
+    it('3. the real id comes from the stored state, not from the model', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        pending: 'answer_to_pending',
+        selection: { kind: 'choose', choice: 2 },
+      });
+      const cancelOrder = spyCancel(repos);
+
+      // Tamper with the stored list: option 2 now points at 1006.
+      await putAwaitingSelection(repos, (state) => ({
+        ...state,
+        candidateOrders: [
+          { n: 1, id: '1003', label: 'Phone case (first)' },
+          { n: 2, id: '1006', label: 'Wireless headphones (second)' },
+          { n: 3, id: '1005', label: 'Wireless headphones (third)' },
+        ],
+      }));
+
+      await handleMessage(SESSION, 'the second one', { repos, llm });
+
+      const state = await repos.sessions.getState(SESSION);
+      expect(state.selectedOrderId).toBe('1006');
+      expect(state.step).toBe('awaiting_confirmation');
+      expect(cancelOrder).not.toHaveBeenCalled();
+    });
+
+    it('4. a choice outside 1..N is treated as unclear (G5)', async () => {
+      for (const choice of [0, 7, -1, 1.5]) {
+        const repos = createMemoryRepositories();
+        const { llm } = makeLlm({
+          pending: 'answer_to_pending',
+          selection: { kind: 'choose', choice },
+        });
+        const cancelOrder = spyCancel(repos);
+        const candidates = await putAwaitingSelection(repos);
+
+        const response = await handleMessage(SESSION, 'that one', { repos, llm });
+
+        const state = await repos.sessions.getState(SESSION);
+        expect(state.step).toBe('awaiting_order_selection');
+        expect(state.retries).toBe(1);
+        expect(response.needsConfirmation).toBe(false);
+        expect(response.options).toEqual(toOptions(candidates));
+        expect(cancelOrder).not.toHaveBeenCalled();
+      }
+    });
+
+    it('5. unclear replies ask again, then give up after MAX_RETRIES', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        pending: 'answer_to_pending',
+        selection: { kind: 'unclear', choice: null },
+      });
+      const cancelOrder = spyCancel(repos);
+      await putAwaitingSelection(repos);
+
+      // MAX_RETRIES unclear replies: still asking, retries counting up.
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+        const response = await handleMessage(SESSION, 'hmm', { repos, llm });
+        const state = await repos.sessions.getState(SESSION);
+
+        expect(state.step).toBe('awaiting_order_selection');
+        expect(state.retries).toBe(attempt);
+        expect(response.options).toHaveLength(3);
+      }
+
+      // One more: give up politely.
+      const response = await handleMessage(SESSION, 'hmm', { repos, llm });
+      const state = await repos.sessions.getState(SESSION);
+
+      expect(state.step).toBe('idle');
+      expect(state.candidateOrders).toBeUndefined();
+      expect(response.needsConfirmation).toBe(false);
+      expect(response.options).toEqual([]);
+      expect(cancelOrder).not.toHaveBeenCalled();
+    });
+
+    it('6. back_out returns to idle and cancels nothing', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        pending: 'answer_to_pending',
+        selection: { kind: 'back_out', choice: null },
+      });
+      const cancelOrder = spyCancel(repos);
+      await putAwaitingSelection(repos);
+
+      const response = await handleMessage(SESSION, 'never mind', { repos, llm });
+
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+      expect(response.needsConfirmation).toBe(false);
+      expect(response.answer.startsWith('FACTS: ')).toBe(true);
+      expect(response.answer.toLowerCase()).toContain('nothing');
+      expect(cancelOrder).not.toHaveBeenCalled();
+    });
+
+    it('7. refuses if the chosen order stopped being cancellable (G4 re-check)', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        pending: 'answer_to_pending',
+        selection: { kind: 'choose', choice: 2 },
+      });
+      const cancelOrder = spyCancel(repos);
+      await putAwaitingSelection(repos);
+
+      const shipped: Order = {
+        id: '1005',
+        customerId: CUSTOMER,
+        status: 'shipped',
+        itemSummary: 'Wireless headphones',
+        createdAt: '2026-10-06T09:00:00.000Z',
+      };
+      vi.spyOn(repos.orders, 'getOrder').mockResolvedValue(shipped);
+      const expected = gateOrderCancellable(shipped);
+      if (expected.ok) throw new Error('fixture problem: shipped should not be cancellable');
+
+      const response = await handleMessage(SESSION, 'the second one', { repos, llm });
+
+      expect(response.answer).toBe(`FACTS: ${expected.userMessage}`);
+      expect(response.needsConfirmation).toBe(false);
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+      expect(cancelOrder).not.toHaveBeenCalled();
+    });
+
+    it('8. refuses if the chosen order now belongs to someone else (G3 re-check)', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        pending: 'answer_to_pending',
+        selection: { kind: 'choose', choice: 2 },
+      });
+      const cancelOrder = spyCancel(repos);
+      await putAwaitingSelection(repos);
+
+      vi.spyOn(repos.orders, 'getOrder').mockResolvedValue({
+        id: '1005',
+        customerId: 'cust_002',
+        status: 'processing',
+        itemSummary: 'Wireless headphones',
+        createdAt: '2026-10-06T09:00:00.000Z',
+      });
+
+      const response = await handleMessage(SESSION, 'the second one', { repos, llm });
+
+      expect(response.answer).toBe(`FACTS: ${ORDER_NOT_FOUND_MESSAGE}`);
+      expect(response.needsConfirmation).toBe(false);
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
       expect(cancelOrder).not.toHaveBeenCalled();
     });
   });

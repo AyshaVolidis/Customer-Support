@@ -6,10 +6,10 @@
 // reply to our own question away from intent classification, but continuing a
 // cancel flow still answers "not implemented yet", as do the other intents.
 
-import { buildCandidateOrders, labelsForLlm, toOptions } from './cancelHelpers';
-import { DEMO_CUSTOMER_ID } from './config';
+import { buildCandidateOrders, labelsForLlm, resolveChoice, toOptions } from './cancelHelpers';
+import { DEMO_CUSTOMER_ID, MAX_RETRIES } from './config';
 import { gateMessage, gateOrderCancellable } from './gates';
-import { classifyIntent, classifyPendingReply, writeReply } from './llm';
+import { classifyIntent, classifyPendingReply, interpretOrderSelection, writeReply } from './llm';
 import { logInfo } from './logger';
 import { getRepositories } from './repositories';
 import type { Order, Repositories, SessionState } from './repositories/types';
@@ -25,6 +25,7 @@ export type Deps = {
   llm: {
     classifyIntent: typeof classifyIntent;
     classifyPendingReply: typeof classifyPendingReply;
+    interpretOrderSelection: typeof interpretOrderSelection;
     writeReply: typeof writeReply;
   };
 };
@@ -314,6 +315,138 @@ async function handleCancelWithOrderId({
   );
 }
 
+/** Told to the model when the customer backs out of cancelling. */
+const BACKED_OUT_FACT =
+  'The customer no longer wants to cancel an order. Nothing will be cancelled. ' +
+  'Acknowledge that briefly.';
+
+/** Told to the model after too many unclear answers to the same question. */
+const GAVE_UP_FACT =
+  'We could not tell which order the customer meant. Nothing has been cancelled. ' +
+  'Apologise briefly and invite them to start again with the order number.';
+
+/** The question we put to the customer once one order is selected. */
+function confirmationFacts(order: Order): string {
+  return [
+    'Ask the customer to confirm this cancellation, and nothing else:',
+    `Cancel order ${order.id} (${order.itemSummary})?`,
+    'Nothing has been cancelled yet.',
+  ].join('\n');
+}
+
+type OrderSelectionArgs = {
+  sessionId: string;
+  message: string;
+  /** The stored state. candidateOrders here is the ONLY source of real ids. */
+  state: SessionState;
+  customerId: string;
+  repos: Repositories;
+  llm: Deps['llm'];
+};
+
+/**
+ * Cancel flow, middle: the customer is answering "which order?".
+ *
+ * The model is shown numbers and labels and returns a number. The real id is
+ * then taken from the STORED candidate list - never from the model - and the
+ * order is re-fetched and re-checked, because it may have shipped or changed
+ * hands since we built the list.
+ */
+async function handleOrderSelection({
+  sessionId,
+  message,
+  state,
+  customerId,
+  repos,
+  llm,
+}: OrderSelectionArgs): Promise<ChatResponse> {
+  const candidates = state.candidateOrders ?? [];
+  const selection = await llm.interpretOrderSelection({
+    message,
+    labels: labelsForLlm(candidates),
+  });
+
+  const backToIdle = async (facts: string): Promise<ChatResponse> => {
+    await repos.sessions.setState(sessionId, customerId, { step: 'idle' });
+    return cancelResponse(
+      await llm.writeReply({ intent: 'cancel_order', facts, customerMessage: message }),
+      false,
+    );
+  };
+
+  if (selection.kind === 'back_out') {
+    logInfo('cancel: customer backed out', { sessionId });
+    return backToIdle(BACKED_OUT_FACT);
+  }
+
+  // G5 lives inside resolveChoice: a number outside 1..N resolves to null, and
+  // an unusable choice is treated exactly like an unclear reply.
+  const chosen =
+    selection.kind === 'choose' && selection.choice !== null
+      ? resolveChoice(candidates, selection.choice)
+      : null;
+
+  if (chosen === null) {
+    const retries = (state.retries ?? 0) + 1;
+
+    if (retries > MAX_RETRIES) {
+      logInfo('cancel: giving up on selection', { retries });
+      return backToIdle(GAVE_UP_FACT);
+    }
+
+    logInfo('cancel: selection unclear, asking again', { retries });
+    await repos.sessions.setState(sessionId, customerId, {
+      step: 'awaiting_order_selection',
+      candidateOrders: candidates,
+      retries,
+    });
+
+    const facts = [
+      'We could not tell which order the customer meant. Ask again, briefly.',
+      'These are the orders they can cancel:',
+      labelsForLlm(candidates),
+      'Tell them to reply with the number.',
+      'Nothing has been cancelled yet.',
+    ].join('\n');
+
+    return cancelResponse(
+      await llm.writeReply({ intent: 'cancel_order', facts, customerMessage: message }),
+      false,
+      toOptions(candidates),
+    );
+  }
+
+  // Re-check from scratch: the list could be minutes old.
+  const found = await lookupOrder({ orderId: chosen.id, customerId, orders: repos.orders });
+
+  if (!found.ok) {
+    logInfo('cancel: chosen order failed a re-check', { reason: found.reason });
+    return backToIdle(found.userMessage);
+  }
+
+  const cancellable = gateOrderCancellable(found.order);
+
+  if (!cancellable.ok) {
+    logInfo('cancel: chosen order is no longer cancellable', { reason: cancellable.reason });
+    return backToIdle(cancellable.userMessage);
+  }
+
+  await repos.sessions.setState(sessionId, customerId, {
+    step: 'awaiting_confirmation',
+    selectedOrderId: found.order.id,
+    retries: 0,
+  });
+
+  return cancelResponse(
+    await llm.writeReply({
+      intent: 'cancel_order',
+      facts: confirmationFacts(found.order),
+      customerMessage: message,
+    }),
+    true,
+  );
+}
+
 /**
  * Handle one customer message.
  *
@@ -335,7 +468,12 @@ export async function handleMessage(
   // `??` keeps these lazy: a test that injects repos never builds the real
   // Supabase client, so no env vars are needed.
   const repos = deps?.repos ?? getRepositories();
-  const llm = deps?.llm ?? { classifyIntent, classifyPendingReply, writeReply };
+  const llm = deps?.llm ?? {
+    classifyIntent,
+    classifyPendingReply,
+    interpretOrderSelection,
+    writeReply,
+  };
   const customerId = DEMO_CUSTOMER_ID;
 
   const stored = await repos.sessions.getState(sessionId);
@@ -352,8 +490,21 @@ export async function handleMessage(
     logInfo('classified a pending reply', { step: stored.step, kind: pending.kind });
 
     if (pending.kind === 'answer_to_pending') {
-      // Leave the stored state exactly as it is: the step that continues this
-      // flow owns it, and it is not built yet.
+      if (stored.step === 'awaiting_order_selection') {
+        return validateResponse(
+          await handleOrderSelection({
+            sessionId,
+            message,
+            state: stored,
+            customerId,
+            repos,
+            llm,
+          }),
+        );
+      }
+
+      // awaiting_confirmation: the step that continues it is not built yet, so
+      // the stored state is left exactly as it is.
       return validateResponse(pendingFlowNotImplemented());
     }
 
