@@ -19,7 +19,7 @@
 //   interpretOrderSelection(...)
 //     -> { kind: 'choose' | 'unclear' | 'back_out', choice: number | null }
 //   interpretConfirmation(...)
-//     -> 'yes' | 'no' | 'other'
+//     -> 'yes' | 'no'   (binary: an unclear reply counts as 'no' - design Q8)
 //
 // writeReply({ intent, facts, customerMessage }) resolves to the string
 // `FACTS: ${facts}` - the facts verbatim after that prefix. So a test can
@@ -77,7 +77,7 @@ export type MakeLlmOptions = {
  * A fake llm whose answers are fixed up front.
  *
  * Every function is a vi.fn, so a test can override one turn at a time with
- * `llm.interpretConfirmation.mockResolvedValueOnce('other')` for multi-turn
+ * `llm.interpretConfirmation.mockResolvedValueOnce('no')` for multi-turn
  * scenarios, and inspect `llm.interpretOrderSelection.mock.calls` to prove no
  * order id was ever handed to the model.
  */

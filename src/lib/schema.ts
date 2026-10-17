@@ -102,10 +102,11 @@ export type OrderSelection = z.infer<typeof OrderSelectionSchema>;
 /** How the model reads a reply to "cancel order X?". */
 export const ConfirmationReplySchema = z.object({
   reply: z
-    .enum(['yes', 'no', 'other'])
+    .enum(['yes', 'no'])
     .describe(
-      'yes only for an explicit confirmation, no for a refusal, ' +
-        'other for anything ambiguous or unrelated',
+      'yes ONLY for a clear, unambiguous agreement to go ahead. ' +
+        'no for a refusal AND for anything unclear - when in doubt, answer no, ' +
+        'because cancelling cannot be undone',
     ),
 });
 

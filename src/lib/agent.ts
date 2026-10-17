@@ -8,8 +8,14 @@
 
 import { buildCandidateOrders, labelsForLlm, resolveChoice, toOptions } from './cancelHelpers';
 import { DEMO_CUSTOMER_ID, MAX_RETRIES } from './config';
-import { gateMessage, gateOrderCancellable } from './gates';
-import { classifyIntent, classifyPendingReply, interpretOrderSelection, writeReply } from './llm';
+import { gateConfirmed, gateMessage, gateOrderCancellable } from './gates';
+import {
+  classifyIntent,
+  classifyPendingReply,
+  interpretConfirmation,
+  interpretOrderSelection,
+  writeReply,
+} from './llm';
 import { logInfo } from './logger';
 import { getRepositories } from './repositories';
 import type { Order, Repositories, SessionState } from './repositories/types';
@@ -26,6 +32,7 @@ export type Deps = {
     classifyIntent: typeof classifyIntent;
     classifyPendingReply: typeof classifyPendingReply;
     interpretOrderSelection: typeof interpretOrderSelection;
+    interpretConfirmation: typeof interpretConfirmation;
     writeReply: typeof writeReply;
   };
 };
@@ -35,22 +42,6 @@ function notImplemented(intent: Intent): ChatResponse {
   return {
     answer: `That part of this assistant is not implemented yet (${intent}).`,
     intent,
-    needsConfirmation: false,
-    options: [],
-    offerHandoff: false,
-    sources: [],
-  };
-}
-
-/**
- * The reply when the customer answered our own pending question.
- *
- * Placeholder: the cancel steps that continue the flow are not built yet.
- */
-function pendingFlowNotImplemented(): ChatResponse {
-  return {
-    answer: 'Thanks - continuing that request is not implemented yet.',
-    intent: 'cancel_order',
     needsConfirmation: false,
     options: [],
     offerHandoff: false,
@@ -325,13 +316,54 @@ const GAVE_UP_FACT =
   'We could not tell which order the customer meant. Nothing has been cancelled. ' +
   'Apologise briefly and invite them to start again with the order number.';
 
-/** The question we put to the customer once one order is selected. */
+/** The question we put to the customer once one order is  selected. */
 function confirmationFacts(order: Order): string {
   return [
     'Ask the customer to confirm this cancellation, and nothing else:',
     `Cancel order ${order.id} (${order.itemSummary})?`,
     'Nothing has been cancelled yet.',
   ].join('\n');
+}
+
+/** Told to the model when the repository refused the cancellation. */
+const CANCEL_FAILED_FACT =
+  'The cancellation did not go through, and the order has not changed. ' +
+  'Apologise briefly and suggest they try again in a moment. ' +
+  'Do NOT tell them the order is cancelled.';
+
+/** Told to the model when we no longer know which order was being confirmed. */
+const LOST_SELECTION_FACT =
+  'We lost track of which order was being cancelled. Nothing has been cancelled. ' +
+  'Apologise briefly and ask them to start again with the cancelled order number.';
+
+type BackToIdleArgs = {
+  sessionId: string;
+  message: string;
+  facts: string;
+  customerId: string;
+  repos: Repositories;
+  llm: Deps['llm'];
+};
+
+/**
+ * End a cancel flow: store a fresh idle state, then reply from the facts.
+ *
+ * The state is built from scratch, so nothing from the abandoned flow - a
+ * selection, a candidate list, a retry count - can survive.
+ */
+async function cancelBackToIdle({
+  sessionId,
+  message,
+  facts,
+  customerId,
+  repos,
+  llm,
+}: BackToIdleArgs): Promise<ChatResponse> {
+  await repos.sessions.setState(sessionId, customerId, { step: 'idle' });
+  return cancelResponse(
+    await llm.writeReply({ intent: 'cancel_order', facts, customerMessage: message }),
+    false,
+  );
 }
 
 type OrderSelectionArgs = {
@@ -366,13 +398,8 @@ async function handleOrderSelection({
     labels: labelsForLlm(candidates),
   });
 
-  const backToIdle = async (facts: string): Promise<ChatResponse> => {
-    await repos.sessions.setState(sessionId, customerId, { step: 'idle' });
-    return cancelResponse(
-      await llm.writeReply({ intent: 'cancel_order', facts, customerMessage: message }),
-      false,
-    );
-  };
+  const backToIdle = (facts: string): Promise<ChatResponse> =>
+    cancelBackToIdle({ sessionId, message, facts, customerId, repos, llm });
 
   if (selection.kind === 'back_out') {
     logInfo('cancel: customer backed out', { sessionId });
@@ -447,6 +474,96 @@ async function handleOrderSelection({
   );
 }
 
+type ConfirmationArgs = {
+  sessionId: string;
+  message: string;
+  /** The stored state. selectedOrderId here is the ONLY id we will cancel. */
+  state: SessionState;
+  customerId: string;
+  repos: Repositories;
+  llm: Deps['llm'];
+};
+
+/**
+ * Cancel flow, last step: the customer is answering "cancel order X?".
+ *
+ * THIS IS THE ONLY PLACE IN THE CODEBASE THAT CALLS cancelOrder.
+ *
+ * The order of operations is the whole safety story, so do not reorder it:
+ *
+ *   1. read the customer's reply (the model reports yes / no, and answers no
+ *      whenever it is unsure - design Q8)
+ *   2. G6 - only an explicit yes gets past this line
+ *   3. re-fetch the order named by the STORED selectedOrderId
+ *   4. re-check G1, G2, G3 (lookupOrder) and G4 - it may have shipped since
+ *   5. only then cancel, and only the id from the state
+ *
+ * A model answer alone can never reach step 5, and a failed cancellation is
+ * never reported as a success.
+ */
+async function handleConfirmation({
+  sessionId,
+  message,
+  state,
+  customerId,
+  repos,
+  llm,
+}: ConfirmationArgs): Promise<ChatResponse> {
+  const backToIdle = (facts: string): Promise<ChatResponse> =>
+    cancelBackToIdle({ sessionId, message, facts, customerId, repos, llm });
+
+  const reply = await llm.interpretConfirmation({ message });
+
+  // G6: only an explicit yes gets past here. The reply is binary, so an
+  // unclear message already arrived as 'no' - we never re-ask, and there is
+  // no retry count for this step.
+  const confirmed = gateConfirmed(reply);
+
+  if (!confirmed.ok) {
+    logInfo('cancel: not confirmed', { sessionId, reason: confirmed.reason });
+    return backToIdle(confirmed.userMessage);
+  }
+
+  // From here on the id comes from the state, never from the model.
+  const selectedOrderId = state.selectedOrderId;
+  if (selectedOrderId === undefined) {
+    logInfo('cancel: confirmed but no order selected', { sessionId });
+    return backToIdle(LOST_SELECTION_FACT);
+  }
+
+  // Re-check G1, G2, G3 - the order may have changed hands or vanished.
+  const found = await lookupOrder({ orderId: selectedOrderId, customerId, orders: repos.orders });
+
+  if (!found.ok) {
+    logInfo('cancel: confirmed order failed a re-check', { reason: found.reason });
+    return backToIdle(found.userMessage);
+  }
+
+  // Re-check G4 - it may have shipped while we were asking.
+  const cancellable = gateOrderCancellable(found.order);
+
+  if (!cancellable.ok) {
+    logInfo('cancel: confirmed order is no longer cancellable', { reason: cancellable.reason });
+    return backToIdle(cancellable.userMessage);
+  }
+
+  const result = await repos.orders.cancelOrder(found.order.id);
+
+  if (!result.ok) {
+    logInfo('cancel: the repository refused', { reason: result.reason, orderId: found.order.id });
+    return backToIdle(CANCEL_FAILED_FACT);
+  }
+
+  logInfo('cancel: order cancelled', { orderId: found.order.id });
+
+  return backToIdle(
+    [
+      `Order ${found.order.id} (${found.order.itemSummary}) has been cancelled.`,
+      'Confirm that to the customer in one short sentence.',
+    ].join('\n'),
+  );
+}
+
 /**
  * Handle one customer message.
  *
@@ -472,6 +589,7 @@ export async function handleMessage(
     classifyIntent,
     classifyPendingReply,
     interpretOrderSelection,
+    interpretConfirmation,
     writeReply,
   };
   const customerId = DEMO_CUSTOMER_ID;
@@ -503,9 +621,16 @@ export async function handleMessage(
         );
       }
 
-      // awaiting_confirmation: the step that continues it is not built yet, so
-      // the stored state is left exactly as it is.
-      return validateResponse(pendingFlowNotImplemented());
+      return validateResponse(
+        await handleConfirmation({
+          sessionId,
+          message,
+          state: stored,
+          customerId,
+          repos,
+          llm,
+        }),
+      );
     }
 
     // new_topic: abandon the flow. Built from scratch, never spread, so no

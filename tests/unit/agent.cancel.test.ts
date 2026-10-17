@@ -17,6 +17,7 @@ import type { CandidateOrder, Order, SessionState } from '../../src/lib/reposito
 import {
   CUSTOMER,
   SESSION,
+  awaitingConfirmation,
   awaitingSelection,
   containsAnyOrderId,
   makeLlm,
@@ -522,6 +523,217 @@ describe('cancel flow', () => {
       expect(response.needsConfirmation).toBe(false);
       expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
       expect(cancelOrder).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('confirming', () => {
+    /** Put the session in awaiting_confirmation and answer it. */
+    async function confirmWith(
+      reply: 'yes' | 'no',
+      orderId = '1005',
+    ): Promise<{
+      repos: ReturnType<typeof createMemoryRepositories>;
+      llm: ReturnType<typeof makeLlm>['llm'];
+      cancelOrder: ReturnType<typeof spyCancel>;
+      response: Awaited<ReturnType<typeof handleMessage>>;
+    }> {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({ pending: 'answer_to_pending', confirmation: reply });
+      await repos.sessions.setState(SESSION, CUSTOMER, awaitingConfirmation(orderId));
+      const cancelOrder = spyCancel(repos);
+      const response = await handleMessage(SESSION, reply, { repos, llm });
+      return { repos, llm, cancelOrder, response };
+    }
+
+    it('1. yes cancels the order exactly once and returns to idle', async () => {
+      const { repos, cancelOrder, response } = await confirmWith('yes', '1005');
+
+      expect(cancelOrder).toHaveBeenCalledTimes(1);
+      expect(cancelOrder).toHaveBeenCalledWith('1005');
+      expect(await statusOf(repos, '1005')).toBe('cancelled');
+
+      expect(response.answer.startsWith('FACTS: ')).toBe(true);
+      expect(response.answer).toMatch(/cancelled/i);
+      expect(response.needsConfirmation).toBe(false);
+
+      const state = await repos.sessions.getState(SESSION);
+      expect(state).toEqual({ step: 'idle' });
+      expect(state.selectedOrderId).toBeUndefined();
+    });
+
+    it('2. the whole flow through the list: ask, choose, confirm', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        intent: 'cancel_order',
+        orderId: null,
+        pending: 'answer_to_pending',
+        selection: { kind: 'choose', choice: 2 },
+        confirmation: 'yes',
+      });
+      const cancelOrder = spyCancel(repos);
+
+      // Turn 1: no order number, so we offer the list.
+      const listed = await handleMessage(SESSION, 'cancel my order', { repos, llm });
+      expect(listed.options).toHaveLength(3);
+      expect((await repos.sessions.getState(SESSION)).step).toBe('awaiting_order_selection');
+
+      // Turn 2: the customer picks option 2.
+      const picked = await handleMessage(SESSION, 'the second one', { repos, llm });
+      expect(picked.needsConfirmation).toBe(true);
+      expect(await repos.sessions.getState(SESSION)).toEqual({
+        step: 'awaiting_confirmation',
+        selectedOrderId: '1005',
+        retries: 0,
+      });
+
+      // Turn 3: the customer confirms.
+      const done = await handleMessage(SESSION, 'yes', { repos, llm });
+
+      expect(cancelOrder).toHaveBeenCalledTimes(1);
+      expect(cancelOrder).toHaveBeenCalledWith('1005');
+      expect(await statusOf(repos, '1005')).toBe('cancelled');
+      expect(done.needsConfirmation).toBe(false);
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+    });
+
+    it('3. the whole flow through an order number: ask, confirm', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({
+        intent: 'cancel_order',
+        orderId: '1005',
+        pending: 'answer_to_pending',
+        confirmation: 'yes',
+      });
+      const cancelOrder = spyCancel(repos);
+
+      const asked = await handleMessage(SESSION, 'cancel order 1005', { repos, llm });
+      expect(asked.needsConfirmation).toBe(true);
+
+      await handleMessage(SESSION, 'yes', { repos, llm });
+
+      expect(cancelOrder).toHaveBeenCalledTimes(1);
+      expect(cancelOrder).toHaveBeenCalledWith('1005');
+      expect(await statusOf(repos, '1005')).toBe('cancelled');
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+    });
+
+    it('4. no cancels nothing and returns to idle', async () => {
+      const { repos, cancelOrder, response } = await confirmWith('no', '1005');
+
+      expect(cancelOrder).not.toHaveBeenCalled();
+      expect(await statusOf(repos, '1005')).toBe('processing');
+      expect(response.needsConfirmation).toBe(false);
+      expect(response.answer.startsWith('FACTS: ')).toBe(true);
+      expect(response.answer.toLowerCase()).toContain('nothing');
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+    });
+
+    // Confirmation is binary (design Q8): the model answers 'no' whenever it is
+    // unsure, so an ambiguous reply ends the flow instead of re-asking.
+    it('5. an ambiguous reply cancels nothing and ends the flow', async () => {
+      const { repos, cancelOrder, response } = await confirmWith('no', '1005');
+
+      expect(cancelOrder).not.toHaveBeenCalled();
+      expect(await statusOf(repos, '1005')).toBe('processing');
+
+      // It does NOT ask again.
+      expect(response.needsConfirmation).toBe(false);
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+
+      // And it tells the customer where they stand.
+      expect(response.answer.startsWith('FACTS: ')).toBe(true);
+      expect(response.answer.toLowerCase()).toContain('nothing');
+    });
+
+    it('5b. never stores a retry count for the confirmation step', async () => {
+      const { repos } = await confirmWith('no', '1005');
+
+      const state = await repos.sessions.getState(SESSION);
+      expect(state.retries).toBeUndefined();
+      expect(state.selectedOrderId).toBeUndefined();
+    });
+
+    it('6. a second yes after a successful cancel does not cancel again', async () => {
+      const { repos, llm, cancelOrder } = await confirmWith('yes', '1005');
+      expect(cancelOrder).toHaveBeenCalledTimes(1);
+
+      // The state is idle now, so the next message is classified afresh.
+      llm.classifyIntent.mockResolvedValue({
+        intent: 'out_of_scope',
+        orderId: null,
+        wantsHuman: false,
+        isComplaint: false,
+      });
+
+      await handleMessage(SESSION, 'yes', { repos, llm });
+
+      expect(cancelOrder).toHaveBeenCalledTimes(1);
+      expect(await statusOf(repos, '1005')).toBe('cancelled');
+    });
+
+    it('7. refuses if the order shipped between asking and confirming (G4 re-check)', async () => {
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({ pending: 'answer_to_pending', confirmation: 'yes' });
+      await repos.sessions.setState(SESSION, CUSTOMER, awaitingConfirmation('1005'));
+      const cancelOrder = spyCancel(repos);
+
+      const shipped: Order = {
+        id: '1005',
+        customerId: CUSTOMER,
+        status: 'shipped',
+        itemSummary: 'Wireless headphones',
+        createdAt: '2026-10-06T09:00:00.000Z',
+      };
+      vi.spyOn(repos.orders, 'getOrder').mockResolvedValue(shipped);
+      const expected = gateOrderCancellable(shipped);
+      if (expected.ok) throw new Error('fixture problem: shipped should not be cancellable');
+
+      const response = await handleMessage(SESSION, 'yes', { repos, llm });
+
+      expect(response.answer).toBe(`FACTS: ${expected.userMessage}`);
+      expect(cancelOrder).not.toHaveBeenCalled();
+      expect(response.needsConfirmation).toBe(false);
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+    });
+
+    it('8. never claims success when cancelOrder fails', async () => {
+      // What a real success says, to compare against.
+      const success = await confirmWith('yes', '1005');
+      const successAnswer = success.response.answer;
+
+      const repos = createMemoryRepositories();
+      const { llm } = makeLlm({ pending: 'answer_to_pending', confirmation: 'yes' });
+      await repos.sessions.setState(SESSION, CUSTOMER, awaitingConfirmation('1005'));
+      const cancelOrder = vi
+        .spyOn(repos.orders, 'cancelOrder')
+        .mockResolvedValue({ ok: false, reason: 'not_cancellable' });
+
+      const response = await handleMessage(SESSION, 'yes', { repos, llm });
+
+      expect(cancelOrder).toHaveBeenCalledTimes(1);
+      expect(response.answer).not.toBe(successAnswer);
+      expect(response.answer).not.toMatch(/(has|was|is) been cancelled|successfully/i);
+      expect(response.needsConfirmation).toBe(false);
+      expect(await repos.sessions.getState(SESSION)).toEqual({ step: 'idle' });
+      // The order itself was never touched, because the repository refused.
+      expect(await statusOf(repos, '1005')).toBe('processing');
+    });
+
+    it('9. cancels exactly the stored selectedOrderId', async () => {
+      const { repos, llm, cancelOrder } = await confirmWith('yes', '1003');
+
+      expect(cancelOrder).toHaveBeenCalledTimes(1);
+      expect(cancelOrder).toHaveBeenCalledWith('1003');
+      expect(await statusOf(repos, '1003')).toBe('cancelled');
+
+      // The other cancellable orders are untouched.
+      expect(await statusOf(repos, '1005')).toBe('processing');
+      expect(await statusOf(repos, '1006')).toBe('processing');
+
+      // The model was never given an order id to return in the first place.
+      expect(containsAnyOrderId(llm.interpretConfirmation.mock.calls, CANCELLABLE_IDS)).toBe(
+        false,
+      );
     });
   });
 });

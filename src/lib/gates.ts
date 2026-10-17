@@ -91,14 +91,21 @@ export function gateChoiceInRange(choice: number | null, count: number): GateRes
   return ok;
 }
 
-/** G6: only an explicit yes counts as confirmation. */
+/**
+ * G6: only an explicit yes counts as confirmation.
+ *
+ * The reply is binary (design Q8): the model answers 'no' whenever it is not
+ * sure, so an ambiguous message arrives here as 'no' and is refused. There is
+ * no third value and no re-asking - cancelling cannot be undone, so the
+ * fail-safe answer is to cancel nothing.
+ */
 export function gateConfirmed(reply: ConfirmationReply['reply']): GateResult {
   if (reply === 'yes') return ok;
 
-  if (reply === 'no') {
-    return fail('declined', 'Nothing was cancelled.');
-  }
-  return fail('not_confirmed', 'I need a clear yes before cancelling. Nothing was cancelled.');
+  return fail(
+    'declined',
+    'Nothing was cancelled.',
+  );
 }
 
 /** G9: the incoming request is usable at all. */

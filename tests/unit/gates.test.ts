@@ -203,17 +203,12 @@ describe('gateConfirmed (G6)', () => {
     expect(gateConfirmed('yes').ok).toBe(true);
   });
 
+  // The reply is binary (Q8): an unclear answer reaches this gate as 'no',
+  // so 'no' is the only rejection there is.
   it('rejects no, and says nothing was cancelled', () => {
     const failed = expectFail(gateConfirmed('no'));
 
     expect(failed.reason).toBe('declined');
-    expect(failed.userMessage).toContain('Nothing was cancelled');
-  });
-
-  it('rejects an unclear reply, and says nothing was cancelled', () => {
-    const failed = expectFail(gateConfirmed('other'));
-
-    expect(failed.reason).toBe('not_confirmed');
     expect(failed.userMessage).toContain('Nothing was cancelled');
   });
 });

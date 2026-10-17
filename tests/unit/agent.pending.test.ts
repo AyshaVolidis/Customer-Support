@@ -57,7 +57,14 @@ function makeLlm(options: { intent?: IntentClassification; pending?: PendingKind
       order.push('interpretOrderSelection');
       return Promise.resolve({ kind: 'choose' as const, choice: 2 });
     }),
-    writeReply: vi.fn((_input: Parameters<typeof writeReply>[0]) => {
+    // Likewise for awaiting_confirmation. 'no' on purpose: this file is about
+    // routing, so it must never cancel anything.
+    interpretConfirmation: vi.fn(() => {
+      order.push('interpretConfirmation');
+      return Promise.resolve('no' as const);
+    }),
+    writeReply: vi.fn((input: Parameters<typeof writeReply>[0]) => {
+      void input;
       order.push('writeReply');
       return Promise.resolve(REPLY);
     }),
@@ -259,18 +266,19 @@ describe('5. answer_to_pending in awaiting_order_selection runs the selection lo
   });
 });
 
-describe('6. answer_to_pending from awaiting_confirmation', () => {
-  it('leaves selectedOrderId unchanged and never classifies the intent', async () => {
+describe('6. answer_to_pending in awaiting_confirmation runs the confirmation logic', () => {
+  it('keeps the selected order and never classifies the intent', async () => {
     const repos = createMemoryRepositories();
     const { llm } = makeLlm({ pending: 'answer_to_pending' });
     await repos.sessions.setState(SESSION, CUSTOMER, AWAITING_CONFIRMATION);
 
     await handleMessage(SESSION, 'yes', { repos, llm });
 
+    // The fake answers 'no', and confirmation is binary (design Q8), so the
+    // flow ends: no re-ask, no retries, back to idle.
     const after = await repos.sessions.getState(SESSION);
-    expect(after.selectedOrderId).toBe('1005');
-    expect(after.step).toBe('awaiting_confirmation');
-    expect(after).toEqual(AWAITING_CONFIRMATION);
+    expect(after).toEqual({ step: 'idle' });
+    expect(llm.interpretConfirmation).toHaveBeenCalledTimes(1);
     expect(llm.classifyIntent).not.toHaveBeenCalled();
   });
 });

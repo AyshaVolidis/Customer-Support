@@ -187,10 +187,14 @@ describe('OrderSelectionSchema', () => {
 });
 
 describe('ConfirmationReplySchema', () => {
-  it('accepts yes, no and other', () => {
+  it('accepts yes and no', () => {
     expect(ConfirmationReplySchema.safeParse({ reply: 'yes' }).success).toBe(true);
     expect(ConfirmationReplySchema.safeParse({ reply: 'no' }).success).toBe(true);
-    expect(ConfirmationReplySchema.safeParse({ reply: 'other' }).success).toBe(true);
+  });
+
+  it('rejects a third value - confirmation is binary', () => {
+    expect(ConfirmationReplySchema.safeParse({ reply: 'other' }).success).toBe(false);
+    expect(ConfirmationReplySchema.safeParse({ reply: 'maybe' }).success).toBe(false);
   });
 
   it('rejects anything else', () => {

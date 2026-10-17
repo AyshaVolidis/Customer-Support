@@ -26,6 +26,12 @@ function fakeLlm(orderId: string | null): Deps['llm'] {
     classifyIntent: vi.fn(() => Promise.resolve(classification)),
     writeReply: vi.fn(() => Promise.resolve(REPLY)),
     classifyPendingReply: vi.fn(() => Promise.resolve({ kind: 'new_topic' as const })),
+    // The lookup flow never reaches these, but Deps['llm'] requires them.
+    // Both answer in the safest way: pick nothing, cancel nothing.
+    interpretOrderSelection: vi.fn(() =>
+      Promise.resolve({ kind: 'unclear' as const, choice: null }),
+    ),
+    interpretConfirmation: vi.fn(() => Promise.resolve('no' as const)),
   };
 }
 

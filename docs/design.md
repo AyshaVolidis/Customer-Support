@@ -140,8 +140,8 @@ Stored in `session_state`, keyed by `sessionId`.
 
 - `retries` is set to **0 whenever a pending step is entered**. The limit is
   therefore **per step**, not per conversation.
-- Each `unclear` reply (order selection) or `other` reply (confirmation)
-  **increments** `retries`.
+- Each `unclear` reply in **order selection** increments `retries`.
+  Confirmation does **not** use retries — it never re-asks (§6.4).
 - If `retries > MAX_RETRIES` → go to `idle` with a polite message.
   Otherwise → ask again.
 - With `MAX_RETRIES = 2`, the customer gets **two re-asks** and the **third**
@@ -213,13 +213,22 @@ The LLM sees **ONLY the numbered labels — never order ids** — and returns:
 
 ### 6.4 `awaiting_confirmation`
 
-The LLM interprets the reply as `yes` | `no` | `other`.
+The LLM interprets the reply as `yes` | `no`. **There is no third value.**
 
 | Reply | Code does |
 | --- | --- |
 | `yes` | **G6** → re-check **G1–G4** → **the CODE calls `cancelOrder`** → success reply → `idle` |
-| `no` | "nothing was cancelled" → `idle` |
-| `other` | Increment `retries`. If `retries > MAX_RETRIES` → polite message, `idle`. Otherwise ask again |
+| `no` | "nothing was cancelled, ask again if you still want to" → `idle` |
+
+**Confirmation is binary, and an unclear reply counts as `no`.** Cancelling is
+destructive and cannot be undone, so the model is told to answer `yes` only for
+a clear, unambiguous agreement and `no` whenever it is unsure. "maybe", "I
+don't know", a question about the order, or anything it cannot read are all
+`no`.
+
+This step therefore **never re-asks and never uses `retries`**. Ending the flow
+costs the customer one message to start again; guessing `yes` costs them an
+order.
 
 ### 6.5 Safety
 
@@ -270,24 +279,33 @@ The LLM interprets the reply as `yes` | `no` | `other`.
             v                               v
        +-------------------------------------------------+
        |              awaiting_confirmation              |
-       |              (entered: retries = 0)             |
+       |        (binary: no retries, never re-asks)      |
        +-------------------------------------------------+
-            |                |                      |
-           yes              no                    other
-            |                |                retries += 1
-    G6 + re-check G1-G4      v                      |
-            |          "nothing was      +----------+----------+
-            v           cancelled"       |                     |
-   [CODE] cancelOrder        |        retries >            retries <=
-            |                v        MAX_RETRIES          MAX_RETRIES
-            v              idle          |                     |
-      success reply                      v                     v
-            |                        polite msg            ask again
-            v                        -> idle
+            |                            |
+           yes                          no
+      (clear agreement)        (refusal OR anything
+            |                   unclear - fail-safe)
+    G6 + re-check G1-G4                  |
+            |                            v
+            v                    "nothing was cancelled,
+   [CODE] cancelOrder             ask again if you still
+            |                      want to"
+     +------+------+                     |
+     |             |                     v
+  ok: true    ok: false                idle
+     |             |
+     v             v
+ success      "it did not go
+  reply        through" (never
+     |         claims success)
+     |             |
+     +------+------+
+            v
           idle
 ```
 
-With `MAX_RETRIES = 2`: two re-asks, then the third unclear reply goes `idle`.
+`MAX_RETRIES = 2` applies to **order selection only**: two re-asks, then the
+third unclear reply goes `idle`. Confirmation has no retries.
 
 ---
 
@@ -474,7 +492,7 @@ Checked **in code, not by the LLM**.
 | **G3** | Order **belongs to this customer** — if not, respond **exactly** as if it does not exist |
 | **G4** | Order status is `processing` (cancellable) |
 | **G5** | Chosen number is in **1..N** of `candidateOrders` |
-| **G6** | The customer **explicitly confirmed** (yes) |
+| **G6** | The customer **explicitly confirmed** — only `yes` passes. The reply is binary, so an unclear answer arrives as `no` and is refused here (§6.4) |
 | **G7** | Model output matches the Zod schema — **retry once**, then a safe error reply |
 | **G8** | Policy answers need **at least one retrieved source** and `confident = true` |
 | **G9** | Message non-empty, `<= MAX_MESSAGE_LENGTH`, `sessionId` present |
@@ -555,8 +573,9 @@ The questions raised while drafting, and how they were settled.
 | --- | --- |
 | **Q1** | "Remembers the conversation" means **only** the workflow state in `session_state` — where it is in a flow. No chat history is stored (§1, §5) |
 | **Q2** | `order_lookup` has its own flow (§10): no `orderId` → most recent order via `getLatestOrder(customerId)`, any status; with `orderId` → G1–G3, with G2 and G3 failing identically. State stays `idle`, no writes |
-| **Q3** | `retries` is set to `0` on entering a pending step, so the limit is **per step**. Each unclear / `other` reply increments it; `retries > MAX_RETRIES` → `idle` with a polite message. `new_topic` resets everything (§4) |
+| **Q3** | `retries` is set to `0` on entering a pending step, so the limit is **per step**. Each unclear reply in **order selection** increments it; `retries > MAX_RETRIES` → `idle` with a polite message. `new_topic` resets everything (§4). Superseded for confirmation by Q8 |
 | **Q4** | Colliding labels get `" - 1 of 2"` / `" - 2 of 2"` appended; the order date is already in the label (§6.2) |
 | **Q5** | `options[].id` is the temporary number `n` as a string (e.g. `"2"`), never the real order id. Real ids appear in reply text only after the customer has selected an order (§6.2, §12) |
 | **Q6** | `sources` = the policy answer's `usedSources`, filtered to file names actually present in the retrieved chunks (§8, §12) |
 | **Q7** | No change to the state JSON. `session_state` already stores `customer_id` as a column of the row; with real auth, the customer id comes from auth (§13) |
+| **Q8** | **Confirmation is binary; an unclear reply counts as `no` (fail-safe).** `interpretConfirmation` returns `'yes' \| 'no'` only, and the model answers `no` whenever it is unsure. The confirmation step never re-asks and does not use `retries` (§6.4, §11 G6) |
