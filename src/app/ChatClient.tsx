@@ -13,6 +13,10 @@ const SESSION_KEY = 'customer-support-session-id';
 type Message = {
   role: 'user' | 'assistant' | 'error';
   text: string;
+  /** Assistant only: the reply asked the customer to confirm something. */
+  needsConfirmation?: boolean;
+  /** Assistant only: the choices the reply offered. `id` is the option number. */
+  options?: ChatResponse['options'];
 };
 
 /* --- Inline icons. No icon library. ------------------------------------- */
@@ -71,6 +75,25 @@ function SendIcon() {
 
 /* --- Session id -------------------------------------------------------- */
 
+/**
+ * What clicking an option does: SHOW the label, SEND the id.
+ *
+ * The id is the temporary option number as a string ("1", "2", "3") - never a
+ * real order id, which the server keeps to itself. Sending the label instead
+ * would hand the backend free text like "Wireless headphones (ordered Oct 7)",
+ * which the pending-reply classifier can read as a new topic.
+ *
+ * Exported so the mapping can be unit-tested without rendering.
+ */
+export function optionMessage(option: { id: string; label: string }): {
+  /** Goes in the POST body as `message`. */
+  sent: string;
+  /** Goes in the customer's own bubble. */
+  display: string;
+} {
+  return { sent: option.id, display: option.label };
+}
+
 /** A session id. randomUUID needs a secure context, so keep a fallback. */
 function newSessionId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -123,8 +146,15 @@ export default function ChatClient() {
     bottomRef.current?.scrollIntoView({ block: 'end' });
   }, [messages, sending]);
 
-  async function send(text: string): Promise<void> {
-    setMessages((previous) => [...previous, { role: 'user', text }]);
+  /**
+   * Send one message.
+   *
+   * `sent` is what goes to the server; `display` is what the customer sees in
+   * their own bubble. They are the same for typed text, and differ for an
+   * option button, which shows a label but sends a number.
+   */
+  async function send(sent: string, display: string = sent): Promise<void> {
+    setMessages((previous) => [...previous, { role: 'user', text: display }]);
     setInput('');
     setSending(true);
 
@@ -132,7 +162,7 @@ export default function ChatClient() {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: getSessionId(), message: text }),
+        body: JSON.stringify({ sessionId: getSessionId(), message: sent }),
       });
 
       const body: unknown = await response.json().catch(() => null);
@@ -147,12 +177,18 @@ export default function ChatClient() {
       }
 
       // The body is validated on the server (gate G7). The client cannot import
-      // the Zod schema at runtime, so check the one field it uses.
-      const answer = (body as ChatResponse | null)?.answer;
+      // the Zod schema at runtime, so check the fields it uses.
+      const reply = body as ChatResponse | null;
+      const answer = reply?.answer;
       setMessages((previous) => [
         ...previous,
         typeof answer === 'string' && answer.length > 0
-          ? { role: 'assistant', text: answer }
+          ? {
+              role: 'assistant',
+              text: answer,
+              needsConfirmation: reply?.needsConfirmation === true,
+              options: Array.isArray(reply?.options) ? reply.options : [],
+            }
           : { role: 'error', text: 'I did not get a reply. Please try again.' },
       ]);
     } catch {
@@ -173,7 +209,23 @@ export default function ChatClient() {
     void send(text);
   }
 
+  /**
+   * A button click. `sent` is the message text; `display` is the bubble text,
+   * which only differs for an option button.
+   */
+  function onActionClick(sent: string, display: string = sent): void {
+    if (sending) return;
+    void send(sent, display);
+  }
+
   const canSend = input.trim().length > 0 && !sending;
+
+  // Only the newest assistant message keeps live buttons. Older ones are
+  // disabled, so a stale "Yes" cannot be clicked after the flow has moved on.
+  const lastAssistantIndex = messages.reduce(
+    (last, message, index) => (message.role === 'assistant' ? index : last),
+    -1,
+  );
 
   return (
     <div className="chat">
@@ -182,7 +234,7 @@ export default function ChatClient() {
           <BrandMark />
         </span>
         <div>
-          <h1>Support Assistant</h1>
+          <h1>Customer Support Assistant</h1>
           <p className="status">
             <span className="status-dot" />
             Online
@@ -209,6 +261,13 @@ export default function ChatClient() {
           // Only the first message of a run gets an avatar.
           const startsRun = index === 0 || messages[index - 1]?.role !== message.role;
 
+          const options = message.options ?? [];
+          const hasActions = message.needsConfirmation === true || options.length > 0;
+          // Live only on the newest assistant message, and never mid-request.
+          // A click adds messages, so the clicked row stops being the newest
+          // and its buttons disable themselves.
+          const actionsDisabled = sending || index !== lastAssistantIndex;
+
           return (
             <div
               // Messages are only appended, so the index is a stable key here.
@@ -224,19 +283,70 @@ export default function ChatClient() {
                   <span className="avatar-spacer" />
                 ))}
 
-              <div
-                className={`bubble ${message.role}`}
-                data-testid={
-                  isUser
-                    ? 'message-user'
-                    : message.role === 'assistant'
-                      ? 'message-assistant'
-                      : 'error-message'
-                }
-                dir="auto"
-              >
-                {message.role === 'error' && <AlertIcon />}
-                <span>{message.text}</span>
+              <div className="stack">
+                <div
+                  className={`bubble ${message.role}`}
+                  data-testid={
+                    isUser
+                      ? 'message-user'
+                      : message.role === 'assistant'
+                        ? 'message-assistant'
+                        : 'error-message'
+                  }
+                  dir="auto"
+                >
+                  {message.role === 'error' && <AlertIcon />}
+                  <span>{message.text}</span>
+                </div>
+
+                {hasActions && (
+                  <div className="actions">
+                    {options.map((option) => (
+                      <button
+                        key={option.id}
+                        type="button"
+                        className="chip"
+                        data-testid="option-button"
+                        dir="auto"
+                        disabled={actionsDisabled}
+                        onClick={() => {
+                          // Shows the label, sends the number.
+                          const { sent, display } = optionMessage(option);
+                          onActionClick(sent, display);
+                        }}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+
+                    {message.needsConfirmation === true && (
+                      <>
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          data-testid="confirm-yes"
+                          disabled={actionsDisabled}
+                          onClick={() => {
+                            onActionClick('yes');
+                          }}
+                        >
+                          Yes
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          data-testid="confirm-no"
+                          disabled={actionsDisabled}
+                          onClick={() => {
+                            onActionClick('no');
+                          }}
+                        >
+                          No
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           );

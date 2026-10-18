@@ -63,6 +63,10 @@ function makeLlm(options: { intent?: IntentClassification; pending?: PendingKind
       order.push('interpretConfirmation');
       return Promise.resolve('no' as const);
     }),
+    writeOutOfScopeReply: vi.fn(() => {
+      order.push('writeOutOfScopeReply');
+      return Promise.resolve(REPLY);
+    }),
     writeReply: vi.fn((input: Parameters<typeof writeReply>[0]) => {
       void input;
       order.push('writeReply');

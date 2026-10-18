@@ -119,6 +119,13 @@ export function makeLlm(options: MakeLlmOptions = {}) {
       return Promise.resolve(confirmation);
     }),
 
+    // Used by the out_of_scope branch, which some cancel tests reach after a
+    // flow ends. Prefixed like writeReply so a test can tell them apart.
+    writeOutOfScopeReply: vi.fn((input: unknown): Promise<string> => {
+      void input;
+      return Promise.resolve('OUT_OF_SCOPE');
+    }),
+
     // Returns the facts verbatim, so tests assert on what the code decided to
     // say rather than on wording a real model would have chosen.
     writeReply: vi.fn((input: WriteReplyInput): Promise<string> => {

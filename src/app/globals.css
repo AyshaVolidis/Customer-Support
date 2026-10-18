@@ -311,8 +311,34 @@ main {
   width: 28px;
 }
 
-.bubble {
+/* Holds a bubble and, under it, that message's buttons. */
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
   max-width: 80%;
+}
+
+.row--user .stack {
+  align-items: flex-end;
+}
+
+.row--assistant .stack,
+.row--error .stack {
+  align-items: flex-start;
+}
+
+/* The buttons offered by one assistant message. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding-inline-start: var(--space-1);
+}
+
+.bubble {
+  max-width: 100%;
   padding: var(--space-3) var(--space-4);
   font-size: var(--text-base);
   line-height: var(--leading-body);
@@ -604,8 +630,8 @@ main {
     padding: var(--space-5) var(--space-4);
   }
 
-  .bubble {
-    max-width: 90%;
+  .stack {
+    max-width: 92%;
   }
 
   .composer {

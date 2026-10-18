@@ -14,6 +14,7 @@ import {
   classifyPendingReply,
   interpretConfirmation,
   interpretOrderSelection,
+  writeOutOfScopeReply,
   writeReply,
 } from './llm';
 import { logInfo } from './logger';
@@ -33,6 +34,7 @@ export type Deps = {
     classifyPendingReply: typeof classifyPendingReply;
     interpretOrderSelection: typeof interpretOrderSelection;
     interpretConfirmation: typeof interpretConfirmation;
+    writeOutOfScopeReply: typeof writeOutOfScopeReply;
     writeReply: typeof writeReply;
   };
 };
@@ -432,7 +434,7 @@ async function handleOrderSelection({
       'We could not tell which order the customer meant. Ask again, briefly.',
       'These are the orders they can cancel:',
       labelsForLlm(candidates),
-      'Tell them to reply with the number.',
+      'Tell them to choose one.',
       'Nothing has been cancelled yet.',
     ].join('\n');
 
@@ -590,6 +592,7 @@ export async function handleMessage(
     classifyPendingReply,
     interpretOrderSelection,
     interpretConfirmation,
+    writeOutOfScopeReply,
     writeReply,
   };
   const customerId = DEMO_CUSTOMER_ID;
@@ -684,6 +687,15 @@ export async function handleMessage(
     case 'human_handoff':
       return validateResponse(notImplemented('human_handoff'));
     case 'out_of_scope':
-      return validateResponse(notImplemented('out_of_scope'));
+      // Reads only the current message: there is no history to lean on, and
+      // this branch touches no order and creates no ticket.
+      return validateResponse({
+        answer: await llm.writeOutOfScopeReply({ message }),
+        intent: 'out_of_scope',
+        needsConfirmation: false,
+        options: [],
+        offerHandoff: false,
+        sources: [],
+      });
   }
 }

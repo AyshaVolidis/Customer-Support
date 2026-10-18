@@ -32,6 +32,7 @@ function fakeLlm(orderId: string | null): Deps['llm'] {
       Promise.resolve({ kind: 'unclear' as const, choice: null }),
     ),
     interpretConfirmation: vi.fn(() => Promise.resolve('no' as const)),
+    writeOutOfScopeReply: vi.fn(() => Promise.resolve('out of scope')),
   };
 }
 
