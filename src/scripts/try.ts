@@ -6,15 +6,17 @@
 //   npm run try -- reply "<message>" "<facts>" [intent]  writeReply; intent defaults
 //                                                        to order_lookup
 //   npm run try -- chat <sessionId> "<message>"          handleMessage end to end
+//   npm run try -- chunks                                how the policy files are chunked
 //
 // Temporary: this is a scratch harness, not part of the workflow.
 
 import { generateText } from 'ai';
 
 import { handleMessage } from '../lib/agent';
-import { DEMO_CUSTOMER_ID } from '../lib/config';
+import { CHUNK_SIZE, DEMO_CUSTOMER_ID } from '../lib/config';
 import { classifyIntent, writeReply } from '../lib/llm';
 import { getModel } from '../lib/model';
+import { loadPolicyChunks } from '../lib/rag';
 import { getRepositories } from '../lib/repositories';
 import { IntentSchema, type Intent } from '../lib/schema';
 
@@ -84,8 +86,43 @@ async function tryChat(sessionId: string, message: string): Promise<void> {
   console.log(JSON.stringify(response, null, 2));
 }
 
+/** Print how the policy files were chunked. No LLM, no database. */
+async function tryChunks(): Promise<void> {
+  const chunks = await loadPolicyChunks();
+
+  console.log(`--- ${String(chunks.length)} chunks, CHUNK_SIZE ${String(CHUNK_SIZE)} ---\n`);
+  console.log(`${'source'.padEnd(26)} ${'len'.padStart(4)}  heading`);
+  console.log(`${'-'.repeat(26)} ${'-'.repeat(4)}  ${'-'.repeat(40)}`);
+
+  for (const chunk of chunks) {
+    const over = chunk.text.length > CHUNK_SIZE ? ' *' : '';
+    console.log(
+      `${chunk.source.padEnd(26)} ${String(chunk.text.length).padStart(4)}  ${chunk.heading}${over}`,
+    );
+  }
+
+  // How many pieces each section was split into, where it was more than one.
+  const perSection = new Map<string, number>();
+  for (const chunk of chunks) {
+    const key = `${chunk.source} :: ${chunk.heading}`;
+    perSection.set(key, (perSection.get(key) ?? 0) + 1);
+  }
+  const split = [...perSection].filter(([, count]) => count > 1);
+
+  console.log(`\n--- sections split into several pieces: ${String(split.length)} ---`);
+  for (const [key, count] of split) console.log(`${String(count)}x  ${key}`);
+
+  const longest = Math.max(...chunks.map((chunk) => chunk.text.length));
+  console.log(`\nlongest chunk: ${String(longest)} characters`);
+}
+
 async function main(): Promise<void> {
   const [mode = 'db', ...rest] = process.argv.slice(2);
+
+  if (mode === 'chunks') {
+    await tryChunks();
+    return;
+  }
 
   if (mode === 'db') {
     await tryDatabase();
@@ -143,7 +180,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  throw new Error(`Unknown mode "${mode}". Use "db", "model", "classify", "reply" or "chat".`);
+  throw new Error(
+    `Unknown mode "${mode}". Use "db", "model", "classify", "reply", "chat" or "chunks".`,
+  );
 }
 
 main().catch((error: unknown) => {

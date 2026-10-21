@@ -13,6 +13,8 @@
   "dependencies": {
     "@ai-sdk/google": "^4.0.93",
     "@ai-sdk/groq": "^4.0.60",
+    "@langchain/core": "^1.2.20",
+    "@langchain/textsplitters": "^1.0.2",
     "@supabase/supabase-js": "^2.117.3",
     "ai": "^7.0.137",
     "next": "16.4.0",

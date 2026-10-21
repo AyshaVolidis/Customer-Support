@@ -23,3 +23,20 @@ export const MAX_MESSAGE_LENGTH = 500;
  * gets two re-asks and the third unclear reply ends the flow.
  */
 export const MAX_RETRIES = 2;
+
+/**
+ * Longest policy chunk we keep, in characters.
+ *
+ * A chunk has to be small enough that several fit in one prompt, and big enough
+ * to answer a question on its own. A '##' section longer than this is split
+ * further by RecursiveCharacterTextSplitter.
+ */
+export const CHUNK_SIZE = 800;
+
+/**
+ * Characters repeated between two pieces of a split section.
+ *
+ * The overlap keeps a sentence that straddles a cut readable in both pieces,
+ * so retrieval does not lose the fact that happened to fall on the boundary.
+ */
+export const CHUNK_OVERLAP = 80;
