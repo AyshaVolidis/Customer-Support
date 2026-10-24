@@ -40,3 +40,24 @@ export const CHUNK_SIZE = 800;
  * so retrieval does not lose the fact that happened to fall on the boundary.
  */
 export const CHUNK_OVERLAP = 80;
+
+/**
+ * Lowest similarity score a retrieved chunk may have and still be used.
+ *
+ * Retrieval always returns its nearest neighbours, even for a question the
+ * policies do not cover, so a floor is what turns "the closest chunks" into
+ * "the relevant chunks". Below it a chunk is dropped, and a question with no
+ * relevant chunk retrieves nothing — which gate G8 then turns into an honest
+ * "I'm not sure" rather than an answer invented from unrelated text.
+ *
+ * This is a PLACEHOLDER value, to be calibrated against the evals.
+ */
+export const MIN_SCORE = 0.5;
+
+/**
+ * How many policy chunks a retrieval returns by default.
+ *
+ * Three is the design's "top 3": enough that the answer is not hostage to one
+ * chunk being slightly closer, few enough to keep the answering prompt short.
+ */
+export const RETRIEVE_K = 3;

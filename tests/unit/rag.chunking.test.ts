@@ -15,8 +15,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 // does not resolve without extra config.
 import { CHUNK_OVERLAP, CHUNK_SIZE } from '../../src/lib/config';
 import {
-  clearPolicyChunkCache,
+  embedText,
   loadPolicyChunks,
+  resetPolicyChunksForTests,
   type PolicyChunk,
 } from '../../src/lib/rag';
 
@@ -39,6 +40,20 @@ const POLICY_FILES = [
 ];
 
 /**
+ * The title of each policy file, taken from its own '# ' line.
+ *
+ * Note damaged-or-wrong-item.md titles itself 'Damaged, defective or wrong
+ * item' — the file name is not the title, which is the point of reading it
+ * from the content.
+ */
+const POLICY_TITLES: Record<string, string> = {
+  'damaged-or-wrong-item.md': 'Damaged, defective or wrong item',
+  'return-policy.md': 'Return policy',
+  'shipping-policy.md': 'Shipping policy',
+  'warranty-policy.md': 'Warranty policy',
+};
+
+/**
  * RecursiveCharacterTextSplitter cuts on separators, so a piece can run a
  * little past chunkSize when the nearest separator does. The overlap is the
  * natural size of that slack.
@@ -58,7 +73,7 @@ function longSection(heading: string, sentences: number): string {
 
 describe('loadPolicyChunks', () => {
   beforeEach(() => {
-    clearPolicyChunkCache();
+    resetPolicyChunksForTests();
     readFileSpy.mockClear();
     readdirSpy.mockClear();
   });
@@ -67,7 +82,7 @@ describe('loadPolicyChunks', () => {
     let chunks: PolicyChunk[];
 
     beforeAll(async () => {
-      clearPolicyChunkCache();
+      resetPolicyChunksForTests();
       chunks = await loadPolicyChunks();
     });
 
@@ -75,11 +90,39 @@ describe('loadPolicyChunks', () => {
       expect(chunks.length).toBeGreaterThan(0);
     });
 
-    it('gives every chunk a source, a heading and text', () => {
+    it('gives every chunk a source, a title, a heading and text', () => {
       for (const chunk of chunks) {
         expect(chunk.source).toMatch(/\.md$/);
+        expect(chunk.title.length).toBeGreaterThan(0);
         expect(chunk.heading.length).toBeGreaterThan(0);
         expect(chunk.text.length).toBeGreaterThan(0);
+      }
+    });
+
+    it("takes each chunk's title from its file's own '# ' line", () => {
+      for (const chunk of chunks) {
+        expect(chunk.title).toBe(POLICY_TITLES[chunk.source]);
+      }
+    });
+
+    it('gives every chunk of a file the same title', () => {
+      const titlesBySource = new Map<string, Set<string>>();
+      for (const chunk of chunks) {
+        const seen = titlesBySource.get(chunk.source) ?? new Set<string>();
+        seen.add(chunk.title);
+        titlesBySource.set(chunk.source, seen);
+      }
+
+      for (const [source, titles] of titlesBySource) {
+        expect([...titles], `titles found in ${source}`).toHaveLength(1);
+      }
+    });
+
+    it('does not use the heading as the title', () => {
+      // The title names the policy, the heading names the section. A chunk
+      // whose title equalled its heading would have lost that distinction.
+      for (const chunk of chunks) {
+        expect(chunk.title).not.toBe(chunk.heading);
       }
     });
 
@@ -90,9 +133,12 @@ describe('loadPolicyChunks', () => {
       }
     });
 
-    it('includes the heading in the chunk text', () => {
+    it("chunk text never starts with a '#' heading line", () => {
+      // The heading lives in the `heading` field only, so a chunk's text is
+      // its body and never opens with the markdown heading it came under.
       for (const chunk of chunks) {
-        expect(chunk.text).toContain(chunk.heading);
+        expect(chunk.text.startsWith('#')).toBe(false);
+        expect(chunk.text).not.toContain(`## ${chunk.heading}`);
       }
     });
 
@@ -111,7 +157,7 @@ describe('loadPolicyChunks', () => {
     it('keeps every chunk within CHUNK_SIZE plus tolerance', () => {
       for (const chunk of chunks) {
         expect(chunk.text.length).toBeLessThanOrEqual(
-          CHUNK_SIZE + SIZE_TOLERANCE,
+          CHUNK_SIZE,
         );
       }
     });
@@ -122,6 +168,7 @@ describe('loadPolicyChunks', () => {
           'heading',
           'source',
           'text',
+          'title',
         ]);
         expect(chunk).not.toHaveProperty('pageContent');
         expect(chunk).not.toHaveProperty('metadata');
@@ -158,6 +205,30 @@ describe('loadPolicyChunks', () => {
         'utf8',
       );
 
+      // No '# ' line at all, so its title has to fall back to the file name.
+      await writeFile(
+        join(dir, 'untitled.md'),
+        '## Only a section heading\n\nA section with no document title above it.\n',
+        'utf8',
+      );
+
+      // A preamble with a body under the title, so it survives as a chunk and
+      // its '# Title' line has to be dropped from the text.
+      await writeFile(
+        join(dir, 'preamble.md'),
+        [
+          '# Preamble policy',
+          '',
+          'An intro paragraph before any section.',
+          '',
+          '## A section',
+          '',
+          'Section body.',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+
       // Must be ignored: only .md files are policy files.
       await writeFile(join(dir, 'notes.txt'), 'not a policy file', 'utf8');
     });
@@ -169,7 +240,67 @@ describe('loadPolicyChunks', () => {
     it('reads only .md files', async () => {
       const chunks = await loadPolicyChunks(dir);
       const sources = [...new Set(chunks.map((c) => c.source))].sort();
-      expect(sources).toEqual(['long.md', 'short.md']);
+      expect(sources).toEqual([
+        'long.md',
+        'preamble.md',
+        'short.md',
+        'untitled.md',
+      ]);
+    });
+
+    it("drops the '# Title' line from a preamble chunk's text", async () => {
+      const chunks = await loadPolicyChunks(dir);
+      const preamble = chunks.find(
+        (c) => c.source === 'preamble.md' && c.heading === 'Preamble policy',
+      );
+
+      expect(preamble).toBeDefined();
+      expect(preamble!.text).toBe('An intro paragraph before any section.');
+      expect(preamble!.text).not.toContain('#');
+    });
+
+    it('keeps a preamble and its sections as separate chunks', async () => {
+      const chunks = await loadPolicyChunks(dir);
+      const fromFile = chunks.filter((c) => c.source === 'preamble.md');
+
+      expect(fromFile.map((c) => c.heading)).toEqual([
+        'Preamble policy',
+        'A section',
+      ]);
+      expect(fromFile.map((c) => c.text)).toEqual([
+        'An intro paragraph before any section.',
+        'Section body.',
+      ]);
+    });
+
+    it("takes the title from the file's '# ' line", async () => {
+      const chunks = await loadPolicyChunks(dir);
+      const short = chunks.filter((c) => c.source === 'short.md');
+
+      expect(short.length).toBeGreaterThan(0);
+      for (const chunk of short) {
+        expect(chunk.title).toBe('Short fixture policy');
+      }
+    });
+
+    it('falls back to the file name when there is no title', async () => {
+      const chunks = await loadPolicyChunks(dir);
+      const untitled = chunks.filter((c) => c.source === 'untitled.md');
+
+      expect(untitled.length).toBeGreaterThan(0);
+      for (const chunk of untitled) {
+        expect(chunk.title).toBe('untitled.md');
+      }
+    });
+
+    it('does not mistake a section heading for the document title', async () => {
+      const chunks = await loadPolicyChunks(dir);
+      const untitled = chunks.find((c) => c.source === 'untitled.md');
+
+      // The file's only heading is '## Only a section heading'; a '##' line is
+      // not a title, so the fallback must win.
+      expect(untitled!.heading).toBe('Only a section heading');
+      expect(untitled!.title).toBe('untitled.md');
     });
 
     it('keeps the source and heading of each short section', async () => {
@@ -181,8 +312,8 @@ describe('loadPolicyChunks', () => {
         'First heading',
         'Second heading',
       ]);
-      expect(short[0].text).toContain('## First heading');
-      expect(short[0].text).toContain('fits in one chunk');
+      // The body alone: the heading line is in `heading`, not in `text`.
+      expect(short[0].text).toBe('A short section that fits in one chunk.');
     });
 
     it('drops the title-only preamble', async () => {
@@ -198,12 +329,14 @@ describe('loadPolicyChunks', () => {
       expect(long.length).toBeGreaterThan(1);
     });
 
-    it('keeps source and heading on every piece of a split section', async () => {
+    it('keeps source, title and heading on every piece of a split section', async () => {
       const chunks = await loadPolicyChunks(dir);
       const long = chunks.filter((c) => c.source === 'long.md');
 
+      expect(long.length).toBeGreaterThan(1);
       for (const chunk of long) {
         expect(chunk.source).toBe('long.md');
+        expect(chunk.title).toBe('Long fixture policy');
         expect(chunk.heading).toBe('A very long heading');
         expect(chunk.text.trim().length).toBeGreaterThan(0);
       }
@@ -269,6 +402,31 @@ describe('loadPolicyChunks', () => {
       expect(second).toEqual(first);
     });
 
+    it('does not cache a failure, so the next call tries again', async () => {
+      const missing = join(tmpdir(), 'policy-dir-that-does-not-exist');
+
+      await expect(loadPolicyChunks(missing)).rejects.toThrow();
+      await expect(loadPolicyChunks(missing)).rejects.toThrow();
+
+      // Two real attempts, not one attempt and a cached rejection.
+      const attempts = readdirSpy.mock.calls.filter(
+        (call) => call[0] === missing,
+      );
+      expect(attempts).toHaveLength(2);
+    });
+
+    it('still works on a valid directory after a failed load', async () => {
+      const missing = join(tmpdir(), 'policy-dir-that-does-not-exist');
+
+      await expect(loadPolicyChunks(missing)).rejects.toThrow();
+
+      // A failure must not poison the cache for other directories, nor leave
+      // the module in a state where the next real load cannot proceed.
+      const chunks = await loadPolicyChunks(dir);
+      expect(chunks.map((c) => c.source)).toEqual(['cached.md']);
+      expect(chunks[0].title).toBe('Cached');
+    });
+
     it('does not serve one directory from another directory cache', async () => {
       const fromFixture = await loadPolicyChunks(dir);
       const fromReal = await loadPolicyChunks();
@@ -276,5 +434,131 @@ describe('loadPolicyChunks', () => {
       expect(fromFixture.map((c) => c.source)).toEqual(['cached.md']);
       expect(fromReal.some((c) => c.source === 'return-policy.md')).toBe(true);
     });
+  });
+});
+
+describe('embedText', () => {
+  beforeEach(() => {
+    resetPolicyChunksForTests();
+  });
+
+  it('starts with the title and the heading', async () => {
+    const chunks = await loadPolicyChunks();
+
+    for (const chunk of chunks) {
+      const prefix = `${chunk.title} > ${chunk.heading}: `;
+      // Sliced rather than startsWith, so a failure shows the actual prefix.
+      expect(embedText(chunk).slice(0, prefix.length)).toBe(prefix);
+    }
+  });
+
+  it('uses the policy title, not the file name', async () => {
+    const chunks = await loadPolicyChunks();
+    const chunk = chunks.find(
+      (c) => c.source === 'damaged-or-wrong-item.md',
+    );
+
+    expect(embedText(chunk!)).toContain('Damaged, defective or wrong item > ');
+    expect(embedText(chunk!)).not.toContain('damaged-or-wrong-item.md');
+  });
+
+  it('states the heading once, in the prefix', async () => {
+    const chunks = await loadPolicyChunks();
+    const chunk = chunks.find(
+      (c) => c.source === 'return-policy.md' && c.heading === 'Refund timing',
+    );
+
+    expect(chunk).toBeDefined();
+    // The heading line is already out of the stored text...
+    expect(chunk!.text).not.toContain('## Refund timing');
+
+    const embedded = embedText(chunk!);
+    // ...so the embedded string names it exactly once, in the prefix.
+    expect(embedded).not.toContain('## Refund timing');
+    expect(embedded.split('Refund timing')).toHaveLength(2);
+  });
+
+  it('leaves the chunk itself unchanged', async () => {
+    const chunks = await loadPolicyChunks();
+
+    for (const chunk of chunks) {
+      const before = chunk.text;
+      embedText(chunk);
+      // A view for the embedder, not a rewrite: the chunk is left alone.
+      expect(chunk.text).toBe(before);
+    }
+  });
+
+  it('is the title, the heading and then the stored text', () => {
+    const chunk: PolicyChunk = {
+      source: 'return-policy.md',
+      title: 'Return policy',
+      heading: 'Refund timing',
+      text: 'Refunds take 5 to 7 business days.',
+    };
+
+    expect(embedText(chunk)).toBe(
+      'Return policy > Refund timing: Refunds take 5 to 7 business days.',
+    );
+  });
+
+  it('passes the stored text through verbatim', () => {
+    // No rewriting here: a '#' inside a body is content, not a heading, and
+    // embedText must not start trimming it.
+    const chunk: PolicyChunk = {
+      source: 'return-policy.md',
+      title: 'Return policy',
+      heading: 'Refund timing',
+      text: 'Use code #REFUND when you ask.',
+    };
+
+    expect(embedText(chunk)).toBe(
+      'Return policy > Refund timing: Use code #REFUND when you ask.',
+    );
+  });
+
+  it('uses the title alone when a chunk has no heading', () => {
+    const preamble: PolicyChunk = {
+      source: 'shipping-policy.md',
+      title: 'Shipping policy',
+      heading: '',
+      text: 'This policy covers every order placed on the store.',
+    };
+
+    expect(embedText(preamble)).toBe(
+      'Shipping policy: This policy covers every order placed on the store.',
+    );
+  });
+
+  it('does not repeat a title that is also the heading', () => {
+    // A preamble chunk takes the '# ' line as its heading, so title and
+    // heading are the same string; stating it twice would waste the prefix.
+    const preamble: PolicyChunk = {
+      source: 'shipping-policy.md',
+      title: 'Shipping policy',
+      heading: 'Shipping policy',
+      text: 'This policy covers every order.',
+    };
+
+    expect(embedText(preamble)).toBe(
+      'Shipping policy: This policy covers every order.',
+    );
+  });
+
+  it('falls back to the file name when a file has no title', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'policy-embed-'));
+    try {
+      await writeFile(
+        join(dir, 'untitled.md'),
+        '## A heading\n\nSome text.\n',
+        'utf8',
+      );
+
+      const chunks = await loadPolicyChunks(dir);
+
+      expect(embedText(chunks[0])).toBe('untitled.md > A heading: Some text.');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

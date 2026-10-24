@@ -13,7 +13,7 @@ import { join } from 'node:path';
 
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 
-import { CHUNK_OVERLAP, CHUNK_SIZE } from './config';
+import { CHUNK_OVERLAP, CHUNK_SIZE, RETRIEVE_K } from './config';
 
 /** Where the policy markdown files live, relative to the project root. */
 const POLICY_DIR = 'data/policies';
@@ -23,11 +23,16 @@ const POLICY_DIR = 'data/policies';
  *
  * `source` is the file name only (e.g. `return-policy.md`), not a path: it is
  * what a policy answer cites as a source, so it has to be stable and readable.
- * `text` includes the heading line, so a chunk read on its own still says what
- * it is about.
+ * `title` is the file's own `# ` line, so it reads the way the policy names
+ * itself rather than the way its file is named. Every chunk of a file carries
+ * the same title, including the pieces the splitter produces.
+ * `text` is the body ALONE, with its own heading line removed: the heading
+ * already lives in `heading`, and keeping it in both places would weight those
+ * few words twice in the embedding and read as a repetition in a prompt.
  */
 export type PolicyChunk = {
   source: string;
+  title: string;
   heading: string;
   text: string;
 };
@@ -71,8 +76,84 @@ export async function loadPolicyChunks(
 }
 
 /** Forget the cached chunks. Exported for tests; production never needs it. */
-export function clearPolicyChunkCache(): void {
+export function resetPolicyChunksForTests(): void {
   cache.clear();
+}
+
+/**
+ * The string that will be embedded for this chunk, once retrieval exists.
+ *
+ * A chunk's body on its own can be ambiguous. It never names its own policy,
+ * and a later piece of a long section does not even carry its heading, so
+ * "report it within 14 days" and "return it within 30 days" embed as
+ * near-identical text while belonging to different policies. Leading with the
+ * title and the heading keeps that distinction in the embedded text.
+ *
+ * `text` is stored without its heading line, so the prefix states the heading
+ * once and the body is not rewritten here.
+ */
+export function embedText(chunk: PolicyChunk): string {
+  // A chunk with no heading is a file preamble, which the title alone names.
+  // A preamble whose heading IS the title would otherwise repeat it.
+  const prefix =
+    chunk.heading.length > 0 && chunk.heading !== chunk.title
+      ? `${chunk.title} > ${chunk.heading}`
+      : chunk.title;
+
+  return `${prefix}: ${chunk.text}`;
+}
+
+/**
+ * The file's own title: its first `# ` line, or the file name if it has none.
+ *
+ * Read from the content rather than derived from the file name, so the title
+ * reads as the policy writes it — 'Damaged, defective or wrong item' rather
+ * than the file name's 'damaged-or-wrong-item.md'.
+ */
+function documentTitle(source: string, content: string): string {
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    // '## ' is a section heading, not the document title.
+    if (trimmed.startsWith('# ')) return trimmed.slice('# '.length).trim();
+  }
+
+  return source;
+}
+
+/**
+ * The part of the LangChain Embeddings interface the retriever needs.
+ *
+ * Narrowed to two methods so a test can supply a deterministic fake without
+ * standing up a LangChain class, and so nothing outside this file has to know
+ * which provider is behind it.
+ */
+export type EmbeddingsLike = {
+  embedDocuments(texts: string[]): Promise<number[][]>;
+  embedQuery(text: string): Promise<number[]>;
+};
+
+/** A retrieved chunk and how similar it was to the query. Higher is closer. */
+export type ScoredPolicyChunk = PolicyChunk & { score: number };
+
+/**
+ * Find the policy chunks most similar to `query`.
+ *
+ * NOT IMPLEMENTED — this is the stub the step 7B tests are written against.
+ */
+export async function retrieve(
+  query: string,
+  k: number = RETRIEVE_K,
+  deps?: { embeddings?: EmbeddingsLike },
+): Promise<ScoredPolicyChunk[]> {
+  void query;
+  void k;
+  void deps;
+  throw new Error('not implemented');
+}
+
+/** Forget the cached vector store. Exported for tests. NOT IMPLEMENTED. */
+export function resetRetrieverForTests(): void {
+  throw new Error('not implemented');
 }
 
 /** The uncached read. Everything below here is plain string work. */
@@ -102,6 +183,8 @@ async function chunkFile(
   content: string,
   splitter: RecursiveCharacterTextSplitter,
 ): Promise<PolicyChunk[]> {
+  // Read once per file, so every chunk of it gets the same title.
+  const title = documentTitle(source, content);
   const chunks: PolicyChunk[] = [];
 
   for (const section of splitSections(content)) {
@@ -115,7 +198,7 @@ async function chunkFile(
     for (const piece of pieces) {
       const text = piece.trim();
       if (text.length === 0) continue; // skip empty chunks
-      chunks.push({ source, heading: section.heading, text });
+      chunks.push({ source, title, heading: section.heading, text });
     }
   }
 
@@ -127,26 +210,32 @@ type Section = { heading: string; text: string };
 /**
  * Split markdown on its `##` headings.
  *
- * The lookahead keeps the heading line at the start of the section it opens, so
- * the heading ends up inside the chunk text as well as in the `heading` field.
+ * The lookahead keeps the heading line at the start of the section it opens,
+ * which is how the heading is read; the line is then dropped from the section
+ * text, so a section's `text` is its body alone and the heading lives only in
+ * the `heading` field.
  *
  * Anything before the first `##` is the file's preamble. In these files that is
  * just the `# Title` line, which answers no question on its own, so a preamble
- * is only kept when it has a body under the title.
+ * is only kept when it has a body under the title — and that title line is
+ * dropped from its text in the same way.
  */
 function splitSections(content: string): Section[] {
   const segments = content.split(/^(?=## )/m);
   const sections: Section[] = [];
 
   for (const segment of segments) {
-    const text = segment.trim();
-    if (text.length === 0) continue;
+    const trimmedSegment = segment.trim();
+    if (trimmedSegment.length === 0) continue;
 
-    const [firstLine, ...bodyLines] = text.split('\n');
+    const [firstLine, ...bodyLines] = trimmedSegment.split('\n');
     const body = bodyLines.join('\n').trim();
 
     if (firstLine.startsWith('## ')) {
-      sections.push({ heading: firstLine.slice('## '.length).trim(), text });
+      sections.push({
+        heading: firstLine.slice('## '.length).trim(),
+        text: body,
+      });
       continue;
     }
 
@@ -157,7 +246,9 @@ function splitSections(content: string): Section[] {
 
     sections.push({
       heading: hasTitle ? firstLine.slice('# '.length).trim() : '',
-      text,
+      // With no '# ' line there is no heading line to drop, so the first line
+      // is body like any other.
+      text: hasTitle ? body : trimmedSegment,
     });
   }
 
