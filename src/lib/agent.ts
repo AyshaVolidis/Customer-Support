@@ -228,7 +228,7 @@ async function handleCancelWithoutOrderId({
   const facts = [
     'These are the orders the customer can still cancel:',
     labelsForLlm(candidates),
-    'Ask which one they mean and tell them to reply with its number.',
+    'Ask which one they mean and tell them to choose from the list.',
     'Nothing has been cancelled yet.',
   ].join('\n');
 
